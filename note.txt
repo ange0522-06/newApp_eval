@@ -1,8 +1,0 @@
-Formation vue js - Student Group
-.intro 
-.theorie
-.pratique
-
-
-Mila mianatra js es6 
-<li v-for="(topic.name,index) in topics" :key="index">{{ topic.name }}</li>
