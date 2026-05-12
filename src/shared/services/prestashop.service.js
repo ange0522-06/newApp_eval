@@ -134,6 +134,34 @@ export async function getOne(resource, id) {
 }
 
 /**
+ * Récupère le XML brut d'une ressource spécifique par son ID.
+ * Cette variante est utile quand le code appelant veut parser le XML lui-même.
+ * @param {string} resource - Nom de la ressource
+ * @param {string|number} id - ID de la ressource
+ * @returns {Promise<string>} Texte XML brut de la ressource
+ */
+export async function getOneXml(resource, id) {
+  try {
+    const response = await fetch(`${BASE_URL}/${resource}/${id}`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'text/xml'
+      }
+    })
+
+    if (!response.ok) {
+      // Ne pas logger ici — laisser l'appelant gérer l'erreur silencieusement
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+    }
+
+    return await response.text()
+  } catch (error) {
+    // Propager sans logger — preloadStocks() gère déjà le catch
+    throw error
+  }
+}
+
+/**
  * Met à jour une ressource via PUT
  * @param {string} resource - Nom de la ressource
  * @param {string|number} id - ID de la ressource

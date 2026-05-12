@@ -20,6 +20,14 @@ export function getAllIds(resource: string): Promise<string[]>
 export function getOne(resource: string, id: string): Promise<string>
 
 /**
+ * Récupère le XML brut d'une ressource spécifique par son ID
+ * @param resource - Nom de la ressource
+ * @param id - ID de la ressource
+ * @returns Texte XML brut de la ressource
+ */
+export function getOneXml(resource: string, id: string): Promise<string>
+
+/**
  * Crée une nouvelle ressource via POST
  * @param resource - Nom de la ressource
  * @param xmlBody - Corps de la requête en XML

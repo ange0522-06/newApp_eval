@@ -1,8 +1,8 @@
 <template>
   <div class="home">
 
-    <!-- État : chargement -->
-    <div v-if="loadingState === 'loading'">
+    <!-- État : chargement initial (avant le premier produit) -->
+    <div v-if="loadingState === 'loading' && products.length === 0">
       Chargement des produits...
     </div>
 
@@ -11,18 +11,28 @@
       Erreur lors du chargement des produits.
     </div>
 
-    <!-- État : aucun produit -->
+    <!-- État : aucun produit après chargement complet -->
     <div v-else-if="loadingState === 'success' && products.length === 0">
       Aucun produit disponible.
     </div>
 
-    <!-- État : succès → grille de produits -->
-    <div v-else-if="loadingState === 'success'" class="products-grid">
+    <!--
+      SOLUTION 3 : Affichage progressif
+      La grille s'affiche dès le premier produit chargé
+      Les produits apparaissent au fur et à mesure sans attendre la fin
+      v-show au lieu de v-if = le DOM existe dès le départ (plus rapide)
+    -->
+    <div v-show="products.length > 0" class="products-grid">
       <ProductCard
         v-for="product in products"
         :key="product.id"
         :product="product"
       />
+    </div>
+
+    <!-- Indicateur discret pendant chargement en cours -->
+    <div v-if="loadingState === 'loading' && products.length > 0" class="loading-more">
+      Chargement en cours...
     </div>
 
   </div>
@@ -36,41 +46,29 @@ import type { Product, LoadingState } from '../types/product.types'
 
 // ─── État ────────────────────────────────────────────────────────────────────
 
-/**
- * Liste des produits récupérés depuis l'API PrestaShop
- * ref([]) = tableau vide au départ, se remplit après l'appel API
- */
 const products = ref<Product[]>([])
-
-/**
- * État du chargement — contrôle ce qui est affiché dans le template
- * 'idle'    → page vient de s'ouvrir
- * 'loading' → appel API en cours
- * 'success' → données reçues
- * 'error'   → appel échoué
- */
 const loadingState = ref<LoadingState>('idle')
 
 // ─── Chargement des produits ─────────────────────────────────────────────────
 
-/**
- * Charge tous les produits depuis PrestaShop
- * Appelée automatiquement au montage du composant via onMounted()
- */
 async function loadProducts(): Promise<void> {
-  // Passer en état "loading" pour afficher le message de chargement
   loadingState.value = 'loading'
+  products.value = []
 
   try {
-    // Appel API → récupère tous les produits actifs
-    // getAllProducts() est dans product.service.ts
-    products.value = await getAllProducts()
+    /**
+     * SOLUTION 3 : callback onProductLoaded
+     * Appelé par product.service.ts dès qu'un produit est prêt
+     * → Le produit s'affiche immédiatement sans attendre les autres
+     * → L'utilisateur voit les produits apparaître un à un
+     */
+    await getAllProducts((product: Product) => {
+      products.value.push(product)
+    })
 
-    // Tout s'est bien passé → afficher les produits
     loadingState.value = 'success'
 
   } catch (error) {
-    // Une erreur s'est produite → afficher le message d'erreur
     console.error('Erreur loadProducts:', error)
     loadingState.value = 'error'
   }
@@ -78,11 +76,6 @@ async function loadProducts(): Promise<void> {
 
 // ─── Cycle de vie ────────────────────────────────────────────────────────────
 
-/**
- * onMounted = s'exécute automatiquement quand le composant
- * est inséré dans le DOM (équivalent de created() en Options API)
- * On charge les produits dès que la page s'ouvre
- */
 onMounted(() => {
   loadProducts()
 })
@@ -97,5 +90,12 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 1rem;
+}
+
+.loading-more {
+  text-align: center;
+  padding: 1rem;
+  color: #888;
+  font-size: 0.9rem;
 }
 </style>

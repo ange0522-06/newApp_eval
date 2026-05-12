@@ -1,66 +1,71 @@
-import { getAllIds, getOne } from '@/shared/services/prestashop.service.js'
+import { getAllIds, getOneXml } from '@/shared/services/prestashop.service.js'
 import type { Product, ProductDetail, Combination, Attribute } from '@/FrontOffice/types/product.types'
 
 // ─── Helpers XML ─────────────────────────────────────────────────────────────
 
-/**
- * Parse une chaîne XML en document XML
- */
 function parseXML(xmlText: string): Document {
   const parser = new DOMParser()
   return parser.parseFromString(xmlText, 'text/xml')
 }
 
-/**
- * Récupère la valeur texte d'un élément XML
- */
 function getText(doc: Document | Element, selector: string): string {
   return doc.querySelector(selector)?.textContent?.trim() ?? ''
 }
 
-/**
- * Récupère la valeur texte d'un élément XML pour une langue donnée
- * ex: <name><language id="1">Tshirt</language></name>
- */
 function getLangText(doc: Document | Element, selector: string, langId = '1'): string {
   return doc.querySelector(`${selector} language[id="${langId}"]`)?.textContent?.trim() ?? ''
 }
 
-// ─── Image ───────────────────────────────────────────────────────────────────
-
-/**
- * Construit l'URL de l'image principale d'un produit
- * Utilise le proxy Vite /prestashop-api
- */
-export function getProductImageUrl(productId: string): string {
-  return `/prestashop-api/images/products/${productId}`
+function getMainImageId(doc: Document | Element): string {
+  return doc.querySelector('associations images image id')?.textContent?.trim() ?? ''
 }
 
-// ─── Taxes ───────────────────────────────────────────────────────────────────
+// ─── Image ───────────────────────────────────────────────────────────────────
 
+export function getProductImageUrl(productId: string, imageId: string): string {
+  const baseUrl = import.meta.env.VITE_API_URL_BACKEND || 'http://localhost/e-commerce/eval'
+  if (!imageId) return '/placeholder.png'
+  // PrestaShop découpe l'ID en sous-dossiers : 16 → /1/6/16-home_default.jpg
+  const folders = imageId.split('').join('/')
+  return `${baseUrl}/img/p/${folders}/${imageId}-home_default.jpg`
+}
+
+// ─── SOLUTION 2 : Cache des taxes ────────────────────────────────────────────
 /**
- * Récupère le taux de taxe à partir d'un id_tax_rules_group
- * Retourne le taux sous forme décimale ex: 0.1165
+ * Cache global des taux de taxe
+ * Clé = id_tax_rules_group, Valeur = taux décimal (ex: 0.1165)
+ * Évite de refaire les mêmes appels API pour la même taxe
+ * Ex: 10 produits avec la même taxe → 1 seul appel au lieu de 10
  */
+const taxRateCache = new Map<string, number>()
+
 async function getTaxRate(idTaxRulesGroup: string): Promise<number> {
+  if (!idTaxRulesGroup || idTaxRulesGroup === '0') return 0
+
+  // Retourner directement si déjà en cache → zéro appel API
+  if (taxRateCache.has(idTaxRulesGroup)) {
+    return taxRateCache.get(idTaxRulesGroup)!
+  }
+
   try {
-    if (!idTaxRulesGroup || idTaxRulesGroup === '0') return 0
-
-    const xml = await getOne('tax_rule_groups', idTaxRulesGroup)
-    const doc = parseXML(xml)
-
-    // Récupérer les tax_rules liées à ce groupe
     const taxRuleIds = await getAllIds('tax_rules')
     for (const id of taxRuleIds) {
-      const ruleXml = await getOne('tax_rules', id)
+      const ruleXml: string = await getOneXml('tax_rules', id)
       const ruleDoc = parseXML(ruleXml)
       const groupId = getText(ruleDoc, 'id_tax_rules_group')
+
       if (groupId === idTaxRulesGroup) {
         const idTax = getText(ruleDoc, 'id_tax')
-        const taxXml = await getOne('taxes', idTax)
+        if (!idTax || idTax === '0') return 0
+
+        const taxXml: string = await getOneXml('taxes', idTax)
         const taxDoc = parseXML(taxXml)
         const rate = parseFloat(getText(taxDoc, 'rate'))
-        return isNaN(rate) ? 0 : rate / 100
+        const result = isNaN(rate) ? 0 : rate / 100
+
+        // Sauvegarder dans le cache pour les prochains produits
+        taxRateCache.set(idTaxRulesGroup, result)
+        return result
       }
     }
     return 0
@@ -71,37 +76,33 @@ async function getTaxRate(idTaxRulesGroup: string): Promise<number> {
 
 // ─── Attributs ───────────────────────────────────────────────────────────────
 
-/**
- * Récupère les attributs d'une combinaison
- */
 async function getCombinationAttributes(combinationId: string): Promise<Attribute[]> {
   try {
-    const xml = await getOne('combinations', combinationId)
+    const xml: string = await getOneXml('combinations', combinationId)
     const doc = parseXML(xml)
-
-    // Récupérer tous les id_attribute dans la combinaison
     const attributeElements = doc.querySelectorAll('associations attributes attribute')
     const attributes: Attribute[] = []
 
-    for (const el of attributeElements) {
-      const idAttribute = el.querySelector('id')?.textContent?.trim() ?? ''
-      if (!idAttribute) continue
+    // Charger tous les attributs d'une combination EN PARALLÈLE
+    await Promise.allSettled(
+      Array.from(attributeElements).map(async (el) => {
+        const idAttribute = el.querySelector('id')?.textContent?.trim() ?? ''
+        if (!idAttribute) return
 
-      const attrXml = await getOne('product_option_values', idAttribute)
-      const attrDoc = parseXML(attrXml)
-      const attrName = getLangText(attrDoc, 'name')
-      const idGroup = getText(attrDoc, 'id_attribute_group')
+        const [attrXml, ] = await Promise.all([
+          getOneXml('product_option_values', idAttribute)
+        ])
+        const attrDoc = parseXML(attrXml)
+        const attrName = getLangText(attrDoc, 'name')
+        const idGroup = getText(attrDoc, 'id_attribute_group')
 
-      const groupXml = await getOne('product_options', idGroup)
-      const groupDoc = parseXML(groupXml)
-      const groupName = getLangText(groupDoc, 'name')
+        const groupXml: string = await getOneXml('product_options', idGroup)
+        const groupDoc = parseXML(groupXml)
+        const groupName = getLangText(groupDoc, 'name')
 
-      attributes.push({
-        id: idAttribute,
-        name: attrName,
-        groupName: groupName
+        attributes.push({ id: idAttribute, name: attrName, groupName })
       })
-    }
+    )
 
     return attributes
   } catch {
@@ -111,73 +112,106 @@ async function getCombinationAttributes(combinationId: string): Promise<Attribut
 
 // ─── Stock ───────────────────────────────────────────────────────────────────
 
+// Cache global des stocks — évite de rappeler getAllIds('stock_availables') pour chaque produit
+const stockCache = new Map<string, number>()
+let stockCacheLoaded = false
+
 /**
- * Récupère le stock disponible d'un produit ou d'une combinaison
+ * Précharge tous les stocks en une seule fois
+ * Appelée une fois avant le chargement des produits
  */
-async function getStock(productId: string, combinationId = '0'): Promise<number> {
+async function preloadStocks(): Promise<void> {
+  if (stockCacheLoaded) return
   try {
     const ids = await getAllIds('stock_availables')
-    for (const id of ids) {
-      const xml = await getOne('stock_availables', id)
-      const doc = parseXML(xml)
-      const pid = getText(doc, 'id_product')
-      const cid = getText(doc, 'id_product_attribute')
-      if (pid === productId && cid === combinationId) {
-        return parseInt(getText(doc, 'quantity')) || 0
-      }
-    }
-    return 0
+    await Promise.allSettled(
+      ids.map(async (id) => {
+        const xml: string = await getOneXml('stock_availables', id)
+        const doc = parseXML(xml)
+        const pid = getText(doc, 'id_product')
+        const cid = getText(doc, 'id_product_attribute')
+        const qty = parseInt(getText(doc, 'quantity')) || 0
+        // Clé unique = productId_combinationId
+        stockCache.set(`${pid}_${cid}`, qty)
+      })
+    )
+    stockCacheLoaded = true
   } catch {
-    return 0
+    stockCacheLoaded = false
+  }
+}
+
+function getStockFromCache(productId: string, combinationId = '0'): number {
+  return stockCache.get(`${productId}_${combinationId}`) ?? 0
+}
+
+// ─── SOLUTION 1 : Chargement d'un seul produit ───────────────────────────────
+/**
+ * Charge les données d'un seul produit
+ * Utilisée dans Promise.allSettled() pour le chargement parallèle
+ */
+async function loadSingleProduct(id: string): Promise<Product | null> {
+  try {
+    const xml: string = await getOneXml('products', id)
+    const doc = parseXML(xml)
+
+    const price = parseFloat(getText(doc, 'price')) || 0
+    const idTaxRulesGroup = getText(doc, 'id_tax_rules_group')
+    const taxRate = await getTaxRate(idTaxRulesGroup)
+    const imageId = getMainImageId(doc)
+    const name = getLangText(doc, 'name')
+
+    return {
+      id,
+      reference:           getText(doc, 'reference'),
+      name:                name || `Produit ${id}`,
+      price,
+      priceTTC:            parseFloat((price * (1 + taxRate)).toFixed(2)),
+      taxRate,
+      imageUrl:            getProductImageUrl(id, imageId),
+      id_category_default: getText(doc, 'id_category_default'),
+      active:              getText(doc, 'active') === '1'
+    }
+  } catch {
+    return null
   }
 }
 
 // ─── Produits ─────────────────────────────────────────────────────────────────
 
 /**
- * Récupère tous les produits (données légères pour la page d'accueil)
+ * Récupère tous les produits
+ *
+ * SOLUTION 1 : Promise.allSettled → charge tous les produits EN PARALLÈLE
+ * SOLUTION 2 : taxRateCache → ne calcule chaque taxe qu'une seule fois
+ * SOLUTION 3 : callback onProductLoaded → affichage progressif dans HomeView
+ *
+ * @param onProductLoaded - callback appelé dès qu'un produit est chargé
+ *   → permet à HomeView d'afficher chaque produit au fur et à mesure
  */
-export async function getAllProducts(): Promise<Product[]> {
+export async function getAllProducts(
+  onProductLoaded?: (product: Product) => void
+): Promise<Product[]> {
   try {
     const ids = await getAllIds('products')
-    console.log(`✅ Nombre de produits trouvés: ${ids.length}`)
-    
+
     const products: Product[] = []
 
-    for (const id of ids) {
-      try {
-        const xml = await getOne('products', id)
-        const doc = parseXML(xml)
+    // SOLUTION 1 : charger tous les produits en parallèle
+    await Promise.allSettled(
+      ids.map(async (id) => {
+        const product = await loadSingleProduct(id)
+        if (product) {
+          products.push(product)
+          // SOLUTION 3 : notifier HomeView dès que ce produit est prêt
+          onProductLoaded?.(product)
+        }
+      })
+    )
 
-        const active = getText(doc, 'active')
-        const name = getLangText(doc, 'name')
-        const price = parseFloat(getText(doc, 'price')) || 0
-        const idTaxRulesGroup = getText(doc, 'id_tax_rules_group')
-        const taxRate = await getTaxRate(idTaxRulesGroup)
-
-        // ✅ Inclure TOUS les produits (actifs et inactifs)
-        products.push({
-          id,
-          reference:            getText(doc, 'reference'),
-          name:                 name || `Produit ${id}`,
-          price,
-          priceTTC:             parseFloat((price * (1 + taxRate)).toFixed(2)),
-          taxRate,
-          imageUrl:             getProductImageUrl(id),
-          id_category_default:  getText(doc, 'id_category_default'),
-          active:               active === '1'
-        })
-        console.log(`✅ Produit chargé: ${name} (ID: ${id}, Actif: ${active})`)
-      } catch (error) {
-        console.error(`❌ Erreur pour le produit ${id}:`, error)
-        continue
-      }
-    }
-
-    console.log(`✅ Total produits chargés: ${products.length}`)
     return products
   } catch (error) {
-    console.error('❌ Erreur getAllProducts:', error)
+    console.error('Erreur getAllProducts:', error)
     throw error
   }
 }
@@ -187,52 +221,58 @@ export async function getAllProducts(): Promise<Product[]> {
  */
 export async function getProductById(id: string): Promise<ProductDetail> {
   try {
-    const xml = await getOne('products', id)
+    // Précharger les stocks si pas encore fait
+    await preloadStocks()
+
+    const xml: string = await getOneXml('products', id)
     const doc = parseXML(xml)
 
     const price = parseFloat(getText(doc, 'price')) || 0
     const idTaxRulesGroup = getText(doc, 'id_tax_rules_group')
     const taxRate = await getTaxRate(idTaxRulesGroup)
+    const imageId = getMainImageId(doc)
 
-    // Récupérer les combinaisons liées à ce produit
+    // Récupérer les IDs des combinaisons
     const combinationElements = doc.querySelectorAll('associations combinations combination')
-    const combinations: Combination[] = []
+    const combinationIds = Array.from(combinationElements)
+      .map(el => el.querySelector('id')?.textContent?.trim() ?? '')
+      .filter(Boolean)
 
-    for (const el of combinationElements) {
-      try {
-        const combinationId = el.querySelector('id')?.textContent?.trim() ?? ''
-        if (!combinationId) continue
-
-        const combXml = await getOne('combinations', combinationId)
+    // SOLUTION 1 : charger toutes les combinaisons EN PARALLÈLE
+    const combinationResults = await Promise.allSettled(
+      combinationIds.map(async (combinationId) => {
+        const combXml: string = await getOneXml('combinations', combinationId)
         const combDoc = parseXML(combXml)
         const combPrice = parseFloat(getText(combDoc, 'price')) || 0
-        const stock = await getStock(id, combinationId)
+        const stock = getStockFromCache(id, combinationId)
         const attributes = await getCombinationAttributes(combinationId)
 
-        combinations.push({
+        return {
           id: combinationId,
-          price: parseFloat((combPrice * (1 + taxRate)).toFixed(2)),
+          price: parseFloat(((price + combPrice) * (1 + taxRate)).toFixed(2)),
           stock,
           attributes
-        })
-      } catch {
-        continue
-      }
-    }
+        } as Combination
+      })
+    )
+
+    const combinations: Combination[] = combinationResults
+      .filter(r => r.status === 'fulfilled')
+      .map(r => (r as PromiseFulfilledResult<Combination>).value)
 
     return {
       id,
-      reference:            getText(doc, 'reference'),
-      name:                 getLangText(doc, 'name'),
-      description:          getLangText(doc, 'description'),
+      reference:           getText(doc, 'reference'),
+      name:                getLangText(doc, 'name'),
+      description:         getLangText(doc, 'description'),
       price,
-      priceTTC:             parseFloat((price * (1 + taxRate)).toFixed(2)),
+      priceTTC:            parseFloat((price * (1 + taxRate)).toFixed(2)),
       taxRate,
-      imageUrl:             getProductImageUrl(id),
-      id_category_default:  getText(doc, 'id_category_default'),
-      active:               getText(doc, 'active') === '1',
+      imageUrl:            getProductImageUrl(id, imageId),
+      id_category_default: getText(doc, 'id_category_default'),
+      active:              getText(doc, 'active') === '1',
       combinations,
-      hasCombinations:      combinations.length > 0
+      hasCombinations:     combinations.length > 0
     }
   } catch (error) {
     console.error(`Erreur getProductById(${id}):`, error)
