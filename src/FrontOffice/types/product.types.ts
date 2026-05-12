@@ -20,6 +20,7 @@ export interface Product {
     taxRate: number;
     imageUrl: string;
     id_category_default: string
+    category_ids: string[];  // Toutes les catégories auxquelles le produit appartient
     active: boolean;
 }
 
@@ -27,6 +28,12 @@ export interface ProductDetail extends Product {
     description: string
     combinations: Combination[]
     hasCombinations: boolean   // true si le produit a des déclinaisons
+}
+
+export interface Category {
+    id: string
+    name: string
+    parent_id?: string
 }
 
 // ─── État du chargement ──────────────────────────────────────────────────────

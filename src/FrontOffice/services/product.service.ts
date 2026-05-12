@@ -1,5 +1,5 @@
 import { getAllIds, getOneXml } from '@/shared/services/prestashop.service.js'
-import type { Product, ProductDetail, Combination, Attribute } from '@/FrontOffice/types/product.types'
+import type { Product, ProductDetail, Combination, Attribute, Category } from '@/FrontOffice/types/product.types'
 
 // ─── Helpers XML ─────────────────────────────────────────────────────────────
 
@@ -160,6 +160,13 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
     const taxRate = await getTaxRate(idTaxRulesGroup)
     const imageId = getMainImageId(doc)
     const name = getLangText(doc, 'name')
+    const idCategoryDefault = getText(doc, 'id_category_default')
+
+    // Récupérer TOUTES les catégories du produit (pas juste la catégorie par défaut)
+    const categoryElements = doc.querySelectorAll('associations categories category')
+    const categoryIds = Array.from(categoryElements)
+      .map(el => el.querySelector('id')?.textContent?.trim() ?? '')
+      .filter(Boolean)
 
     return {
       id,
@@ -169,7 +176,8 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
       priceTTC:            parseFloat((price * (1 + taxRate)).toFixed(2)),
       taxRate,
       imageUrl:            getProductImageUrl(id, imageId),
-      id_category_default: getText(doc, 'id_category_default'),
+      id_category_default: idCategoryDefault,
+      category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
       active:              getText(doc, 'active') === '1'
     }
   } catch {
@@ -260,6 +268,13 @@ export async function getProductById(id: string): Promise<ProductDetail> {
       .filter(r => r.status === 'fulfilled')
       .map(r => (r as PromiseFulfilledResult<Combination>).value)
 
+    // Récupérer TOUTES les catégories du produit
+    const categoryElements = doc.querySelectorAll('associations categories category')
+    const categoryIds = Array.from(categoryElements)
+      .map(el => el.querySelector('id')?.textContent?.trim() ?? '')
+      .filter(Boolean)
+    const idCategoryDefault = getText(doc, 'id_category_default')
+
     return {
       id,
       reference:           getText(doc, 'reference'),
@@ -269,7 +284,8 @@ export async function getProductById(id: string): Promise<ProductDetail> {
       priceTTC:            parseFloat((price * (1 + taxRate)).toFixed(2)),
       taxRate,
       imageUrl:            getProductImageUrl(id, imageId),
-      id_category_default: getText(doc, 'id_category_default'),
+      id_category_default: idCategoryDefault,
+      category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
       active:              getText(doc, 'active') === '1',
       combinations,
       hasCombinations:     combinations.length > 0
@@ -277,5 +293,45 @@ export async function getProductById(id: string): Promise<ProductDetail> {
   } catch (error) {
     console.error(`Erreur getProductById(${id}):`, error)
     throw error
+  }
+}
+
+// ─── Catégories ───────────────────────────────────────────────────────────────
+
+/**
+ * Récupère toutes les catégories (hors racine et accueil)
+ */
+export async function getAllCategories(): Promise<Category[]> {
+  try {
+    const ids = await getAllIds('categories')
+    const categories: Category[] = []
+
+    for (const id of ids) {
+      try {
+        const xml = await getOneXml('categories', id) as string
+        const doc = parseXML(xml)
+        const name = getLangText(doc, 'name')
+        const idParent = getText(doc, 'id_parent')
+        
+        // Exclure la catégorie racine (id=1) et accueil (id=2)
+        if (id !== '1' && id !== '2') {
+          categories.push({
+            id,
+            name: name || `Catégorie ${id}`,
+            parent_id: idParent
+          })
+        }
+      } catch {
+        // Ignorer les catégories inaccessibles
+        continue
+      }
+    }
+
+    // Trier par nom
+    categories.sort((a, b) => a.name.localeCompare(b.name))
+    return categories
+  } catch (error) {
+    console.error('Erreur getAllCategories:', error)
+    return []
   }
 }
