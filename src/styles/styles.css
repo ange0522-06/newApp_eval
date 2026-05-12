@@ -866,6 +866,123 @@ progress::-moz-progress-bar {
 }
 
 /* ===================================
+   LANDING PAGE STYLES
+   =================================== */
+
+.landing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--color-bg-secondary);
+  font-family: var(--font-family-sans);
+  padding: 2rem;
+}
+
+.landing-container {
+  text-align: center;
+  animation: fadeInLanding 0.6s ease-in-out;
+}
+
+.landing-header {
+  margin-bottom: 4rem;
+  color: var(--color-primary);
+}
+
+.landing-header h1 {
+  font-size: 3.5rem;
+  font-weight: 700;
+  margin: 0 0 1rem 0;
+  text-shadow: none;
+}
+
+.landing-header p {
+  font-size: 1.5rem;
+  margin: 0;
+  opacity: 1;
+  color: var(--color-text-secondary);
+}
+
+.landing-buttons {
+  display: flex;
+  gap: 2rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.landing-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 3rem 2rem;
+  min-width: 300px;
+  border: none;
+  border-radius: 16px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+}
+
+.landing-btn--bo {
+  background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-primary-light) 100%);
+  color: white;
+}
+
+.landing-btn--bo:hover {
+  transform: translateY(-8px);
+  box-shadow: 0 12px 48px rgba(15, 52, 96, 0.4);
+}
+
+.landing-btn--bo:active {
+  transform: translateY(-4px);
+}
+
+.landing-btn--fo {
+  background: linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-dark) 100%);
+  color: var(--color-primary);
+}
+
+.landing-btn--fo:hover {
+  transform: translateY(-8px);
+  box-shadow: 0 12px 48px rgba(0, 212, 255, 0.4);
+}
+
+.landing-btn--fo:active {
+  transform: translateY(-4px);
+}
+
+.landing-btn__icon {
+  font-size: 3rem;
+}
+
+.landing-btn__title {
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+.landing-btn__description {
+  font-size: 0.9rem;
+  opacity: 0.95;
+  line-height: 1.4;
+}
+
+@keyframes fadeInLanding {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ===================================
    RESPONSIVE DESIGN
    =================================== */
 
@@ -897,6 +1014,38 @@ progress::-moz-progress-bar {
 
   .page-content {
     padding: var(--spacing-md);
+  }
+
+  /* Landing Page Mobile */
+  .landing {
+    padding: 2rem;
+  }
+
+  .landing-header h1 {
+    font-size: 2rem;
+  }
+
+  .landing-header p {
+    font-size: 1.2rem;
+  }
+
+  .landing-buttons {
+    flex-direction: column;
+    gap: 1.5rem;
+    max-width: 100%;
+  }
+
+  .landing-btn {
+    min-width: 100%;
+    padding: 2rem 1.5rem;
+  }
+
+  .landing-btn__icon {
+    font-size: 2rem;
+  }
+
+  .landing-btn__title {
+    font-size: 1.3rem;
   }
 }
 

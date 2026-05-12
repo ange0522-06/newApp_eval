@@ -6,7 +6,7 @@
  * La clé API est injectée automatiquement via le proxy (ws_key dans l'URL)
  */
 
-import { API_CONFIG } from '../config/config';
+import { API_CONFIG } from '../../BackOffice/config/config';
 
 const BASE_URL = API_CONFIG.BASE_URL;
 
@@ -17,7 +17,10 @@ const BASE_URL = API_CONFIG.BASE_URL;
  */
 export async function getAllIds(resource) {
   try {
-    const response = await fetch(`${BASE_URL}/${resource}`, {
+    const url = `${BASE_URL}/${resource}`;
+    console.log(`📡 Récupération des IDs pour: ${resource} | URL: ${url}`);
+    
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Content-Type': 'text/xml'
@@ -29,30 +32,42 @@ export async function getAllIds(resource) {
     }
 
     const xmlText = await response.text();
-    console.log(`XML reçu pour ${resource}:`, xmlText.substring(0, 500));
+    console.log(`📋 XML reçu (premiers 1000 chars):`, xmlText.substring(0, 1000));
     
     const parser = new DOMParser();
     const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+
+    // Vérifier les erreurs de parsing XML
+    if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
+      console.error(`❌ Erreur de parsing XML pour ${resource}:`, xmlDoc);
+      return [];
+    }
 
     // Chercher les enfants directs de la ressource (ex: product, customer, order, stock_available)
     const resourceElement = xmlDoc.querySelector(resource);
     
     if (!resourceElement) {
-      console.warn(`Ressource ${resource} non trouvée dans le XML`);
+      console.warn(`⚠️ Ressource ${resource} non trouvée dans le XML`);
+      // Afficher la structure du document pour débogage
+      const prestashop = xmlDoc.querySelector('prestashop');
+      if (prestashop) {
+        console.log(`📦 Éléments disponibles dans prestashop:`, Array.from(prestashop.children).map(el => el.tagName));
+      }
       return [];
     }
 
     // Récupérer le nom singulier de la ressource (products -> product, stock_availables -> stock_available)
     const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+    console.log(`🔍 Cherche éléments singuliers: "${singular}"`);
     
     // Chercher tous les éléments enfants directs avec le nom singulier
-    const elements = resourceElement.querySelectorAll(singular);
+    const elements = resourceElement.querySelectorAll(`:scope > ${singular}`);
     const ids = Array.from(elements).map(el => el.getAttribute('id')).filter(id => id);
 
-    console.log(`IDs trouvés pour ${resource}:`, ids);
+    console.log(`✅ IDs trouvés pour ${resource}:`, ids);
     return ids;
   } catch (error) {
-    console.error(`Erreur getAllIds(${resource}):`, error);
+    console.error(`❌ Erreur getAllIds(${resource}):`, error);
     throw error;
   }
 }
@@ -178,7 +193,7 @@ export async function deleteResource(resource, id) {
  * Crée une nouvelle ressource via POST
  * @param {string} resource - Nom de la ressource
  * @param {string} xmlBody - Corps de la requête en XML
- * @returns {Promise<boolean>} true si succès, false sinon
+ * @returns {Promise<{success: boolean, id?: string, error?: string}>} Résultat avec ID si succès
  */
 export async function postXML(resource, xmlBody) {
   try {
@@ -191,13 +206,30 @@ export async function postXML(resource, xmlBody) {
     });
 
     if (!response.ok) {
-      console.warn(`POST échoué: HTTP ${response.status}`);
-      return false;
+      const errorText = await response.text();
+      const errorMsg = `HTTP ${response.status}: ${response.statusText}. Details: ${errorText.substring(0, 200)}`;
+      console.error(`POST échoué pour ${resource}:`, errorMsg);
+      return { success: false, error: errorMsg };
     }
 
-    return true;
+    const responseText = await response.text();
+    
+    // Parser la réponse XML pour trouver l'ID
+    try {
+      const parser = new DOMParser();
+      const xmlDoc = parser.parseFromString(responseText, 'text/xml');
+      const idElement = xmlDoc.querySelector('id');
+      const id = idElement?.textContent;
+      
+      console.log(`POST succès pour ${resource}, ID: ${id}`);
+      return { success: true, id };
+    } catch (parseError) {
+      console.warn(`Impossible de parser ID de la réponse pour ${resource}`);
+      return { success: true, id: undefined };
+    }
   } catch (error) {
-    console.error(`Erreur postXML(${resource}):`, error);
-    return false;
+    const errorMsg = `Erreur postXML(${resource}): ${error instanceof Error ? error.message : String(error)}`;
+    console.error(errorMsg);
+    return { success: false, error: errorMsg };
   }
 }

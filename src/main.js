@@ -4,7 +4,7 @@ import App from './App.vue'
 import router from './router/index.ts'
 
 // Importation du fichier CSS unique
-import './BackOffice/styles/styles.css'
+import './styles/styles.css'
 
 const app = createApp(App)
 

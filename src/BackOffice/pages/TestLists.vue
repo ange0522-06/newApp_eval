@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive } from 'vue';
-import { getAllIds, getOne } from '../services/prestashop.service.js';
+import { getAllIds, getOne } from '../../shared/services/prestashop.service.js';
 import ListProductsTab from '../components/ListProductsTab.vue';
 import ListClientsTab from '../components/ListClientsTab.vue';
 import ListCommandesTab from '../components/ListCommandesTab.vue';

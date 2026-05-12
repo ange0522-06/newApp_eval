@@ -1,80 +1,222 @@
 <template>
   <div class="reset-module">
-    <h1>Module de Réinitialisation PrestaShop</h1>
-    
-    <div class="warning-message">
-      ⚠️ Cette action va réinitialiser TOUTES les données: produits, stocks, clients et commandes.
-      Cette opération est irréversible. Continuer ?
+    <h1>Réinitialisation des données</h1>
+
+    <!-- Avertissement -->
+    <div class="warning-box">
+      <p class="warning-text">
+        Cette action supprimera toutes les données importées.
+        <br />
+        <strong>Cette action est irréversible.</strong>
+      </p>
     </div>
 
-    <div class="buttons-grid">
+    <!-- Bouton de réinitialisation -->
+    <div class="button-container">
       <button
-        @click="confirmAndResetAll"
+        @click="openConfirmModal"
         :disabled="isRunning"
-        class="btn btn-reset-all"
+        class="btn btn-reset"
+        :class="{ 'is-loading': isRunning }"
       >
-        <span v-if="!isRunning">🔄 Réinitialiser TOUT</span>
-        <span v-else>
-          <span class="spinner"></span> Réinitialisation en cours...
-        </span>
+        <span v-if="!isRunning">Réinitialiser les données</span>
+        <span v-else>Réinitialisation en cours...</span>
       </button>
     </div>
 
-    <!-- Section progression -->
-    <div v-if="isRunning" class="progress-section">
-      <p>Traitement : <strong>{{ progress }} / {{ total }}</strong></p>
-      <progress :value="progress" :max="total"></progress>
-      <p class="current-operation">{{ currentOperation }}</p>
+    <!-- Modale de confirmation -->
+    <div v-if="showConfirmModal" class="modal-overlay" @click="closeConfirmModal">
+      <div class="modal-content" @click.stop>
+        <h2>Confirmer la réinitialisation</h2>
+        <p>Êtes-vous sûr ? Cette action est irréversible.</p>
+        
+        <div class="modal-buttons">
+          <button
+            @click="confirmAndReset"
+            class="btn btn-confirm"
+          >
+            Confirmer
+          </button>
+          <button
+            @click="closeConfirmModal"
+            class="btn btn-cancel"
+          >
+            Annuler
+          </button>
+        </div>
+      </div>
     </div>
 
-    <!-- Section rapport -->
-    <div v-if="!isRunning && total > 0" class="report-section">
-      <h2>Résumé de la réinitialisation</h2>
-      
-      <div class="success-message">
-        ✅ <strong>{{ totalSuccess }} élément(s)</strong> traité(s) avec succès
-      </div>
-
-      <div v-if="totalFailed > 0" class="error-message">
-        ❌ <strong>{{ totalFailed }} erreur(s)</strong>
-      </div>
-
-      <div v-if="errors.length > 0" class="errors-list">
-        <h3>Détails des erreurs :</h3>
-        <ul>
-          <li v-for="(error, index) in errors" :key="index">
-            {{ error }}
-          </li>
-        </ul>
-      </div>
+    <!-- Message de résultat -->
+    <div
+      v-if="message"
+      class="message"
+      :class="{ 'is-success': isSuccess, 'is-error': !isSuccess }"
+    >
+      {{ message }}
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref } from 'vue';
 import { useReset } from '../composables/useReset';
 
-const {
-  progress,
-  total,
-  errors,
-  isRunning,
-  resetAll,
-  currentOperation
-} = useReset();
+const { isRunning, message, isSuccess, performReset } = useReset();
+const showConfirmModal = ref(false);
 
-const totalSuccess = computed(() => {
-  return total.value - errors.value.length;
-});
+function openConfirmModal(): void {
+  showConfirmModal.value = true;
+}
 
-const totalFailed = computed(() => {
-  return errors.value.length;
-});
+function closeConfirmModal(): void {
+  showConfirmModal.value = false;
+}
 
-function confirmAndResetAll() {
-  if (window.confirm('⚠️ ATTENTION: Cette action est IRRÉVERSIBLE!\n\nToutes les données vont être réinitialisées:\n- Produits: SUPPRIMÉS\n- Stocks: Mis à 0\n- Clients: SUPPRIMÉS\n- Commandes: SUPPRIMÉES\n\nContinuer ?')) {
-    resetAll();
-  }
+async function confirmAndReset(): Promise<void> {
+  closeConfirmModal();
+  await performReset();
 }
 </script>
+
+<style scoped>
+.reset-module {
+  max-width: 600px;
+  margin: 2rem auto;
+  padding: 2rem;
+}
+
+h1 {
+  font-size: 2rem;
+  margin-bottom: 2rem;
+  color: #333;
+}
+
+.warning-box {
+  background-color: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 4px;
+  padding: 1rem;
+  margin-bottom: 2rem;
+}
+
+.warning-text {
+  color: #856404;
+  margin: 0;
+  line-height: 1.6;
+}
+
+.button-container {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 2rem;
+}
+
+.btn {
+  padding: 0.75rem 2rem;
+  font-size: 1rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  font-weight: 600;
+}
+
+.btn-reset {
+  background-color: #dc3545;
+  color: white;
+}
+
+.btn-reset:hover:not(:disabled) {
+  background-color: #c82333;
+}
+
+.btn-reset:disabled {
+  background-color: #6c757d;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.btn-reset.is-loading {
+  opacity: 0.8;
+}
+
+/* Modale */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: white;
+  border-radius: 8px;
+  padding: 2rem;
+  max-width: 400px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.modal-content h2 {
+  margin-top: 0;
+  margin-bottom: 1rem;
+  font-size: 1.5rem;
+  color: #333;
+}
+
+.modal-content p {
+  margin-bottom: 2rem;
+  color: #666;
+}
+
+.modal-buttons {
+  display: flex;
+  gap: 1rem;
+  justify-content: flex-end;
+}
+
+.btn-confirm {
+  background-color: #dc3545;
+  color: white;
+}
+
+.btn-confirm:hover {
+  background-color: #c82333;
+}
+
+.btn-cancel {
+  background-color: #6c757d;
+  color: white;
+}
+
+.btn-cancel:hover {
+  background-color: #5a6268;
+}
+
+/* Messages */
+.message {
+  margin-top: 2rem;
+  padding: 1rem;
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 600;
+}
+
+.message.is-success {
+  background-color: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+
+.message.is-error {
+  background-color: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+}
+</style>

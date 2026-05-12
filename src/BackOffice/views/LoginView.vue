@@ -12,7 +12,7 @@
             id="email"
             v-model="email"
             type="email"
-            placeholder="admin@prestashop.com"
+            placeholder="angenierazafimahatratra@gmail.com"
             required
             :disabled="isLoading"
             class="form-input"
@@ -26,7 +26,7 @@
             id="password"
             v-model="password"
             type="password"
-            placeholder="••••••••"
+            placeholder="prestashop"
             required
             :disabled="isLoading"
             class="form-input"
@@ -51,6 +51,7 @@
 
       <div class="info-text">
         <p>Utilisez les identifiants de l'administrateur PrestaShop</p>
+        <a href="/">Accueil</a>
       </div>
     </div>
   </div>
@@ -65,7 +66,7 @@ const router = useRouter();
 const { login, errorMessage, isLoading, clearError } = useAuth();
 
 // Valeurs par défaut pré-remplies
-const email = ref<string>('admin@prestashop.com');
+const email = ref<string>('angenierazafimahatratra@gmail.com');
 const password = ref<string>('prestashop');
 
 async function handleLogin() {
