@@ -6,6 +6,7 @@ export const API_CONFIG = {
   // Proxy Vite endpoint pour éviter les erreurs CORS
   // Le proxy rewrite /prestashop-api vers http://localhost/e-commerce/eval
   BASE_URL: '/prestashop-api/api',
+  BO_LOGIN_URL: '/newapp-api/bo-login.php',
 } as const;
 
 export const STORAGE_KEYS = {

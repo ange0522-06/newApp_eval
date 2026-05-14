@@ -1,447 +1,268 @@
 <template>
   <div class="import-view">
-    <h1>Import des données</h1>
+    <h1>Import des donnees</h1>
 
-    <!-- Message global avec transaction -->
-    <div v-if="globalMessage" :class="['message', 'global-message', globalMessageSuccess ? 'success' : 'error']">
+    <div v-if="globalMessage" :class="['message', globalMessageStatus]">
       {{ globalMessage }}
     </div>
 
-    <!-- Bouton Import All (Tout ou Rien) -->
-    <div class="import-all-section">
-      <h2>🔄 Import transactionnel (TOUT OU RIEN)</h2>
+    <section class="import-section">
+      <h2>Import transactionnel</h2>
       <p class="description">
-        Sélectionnez les 3 fichiers et cliquez pour importer en une seule transaction.
-        Si une étape échoue, toutes les ressources créées seront supprimées (rollback).
+        Selectionnez les 3 fichiers CSV et images.zip, puis lancez l'import. Si une etape echoue,
+        les ressources deja creees sont supprimees et les mises a jour sont restaurees.
       </p>
+
+      <div class="file-grid">
+        <label>
+          Fichier 1 - Produits
+          <input ref="file1Input" type="file" accept=".csv" @change="handleFileChange($event, 1)" />
+        </label>
+
+        <label>
+          Fichier 2 - Declinaisons / stock
+          <input ref="file2Input" type="file" accept=".csv" @change="handleFileChange($event, 2)" />
+        </label>
+
+        <label>
+          Fichier 3 - Clients / paniers / commandes
+          <input ref="file3Input" type="file" accept=".csv" @change="handleFileChange($event, 3)" />
+        </label>
+
+        <label>
+          Fichier 4 - Images
+          <input ref="zipInput" type="file" accept=".zip" @change="handleFileChange($event, 4)" />
+        </label>
+      </div>
+
       <button
-        @click="importAll"
-        :disabled="!file1 || !file2 || !file3 || isImportingAll"
         class="btn btn-import-all"
+        :disabled="!file1 || !file2 || !file3 || !zipFile || isImportingAll"
+        @click="importAll"
       >
-        {{ isImportingAll ? '⏳ Import en cours...' : '✅ IMPORTER TOUT (3 FICHIERS)' }}
+        {{ isImportingAll ? 'Import en cours...' : 'Importer les 4 fichiers' }}
       </button>
-    </div>
 
-    <hr class="separator" />
-
-    <!-- Fichier 1 : Produits -->
-    <div class="import-section">
-      <h2>Fichier 1 — Produits</h2>
-      <p class="description">
-        Colonnes attendues : date_produit, nom, reference, prix_ttc, Taxe, categorie
-      </p>
-
-      <div class="file-input-group">
-        <input
-          ref="file1Input"
-          type="file"
-          accept=".csv"
-          @change="handleFile1Change"
-          :disabled="isImporting1"
-          class="file-input"
-        />
-        <button
-          @click="importFile1"
-          :disabled="!file1 || isImporting1"
-          class="btn btn-import"
-        >
-          {{ isImporting1 ? 'Import en cours...' : 'Importer Fichier 1' }}
-        </button>
+      <div v-if="showImportProgress" class="import-progress">
+        <p class="progress-title">Suivi de l'import</p>
+        <ul class="progress-list">
+          <li v-for="step in importSteps" :key="step.key" :class="['progress-item', step.status]">
+            <span class="progress-label">{{ step.label }}</span>
+            <span class="progress-status">{{ getStepStatusLabel(step) }}</span>
+            <small v-if="step.detail" class="progress-detail">{{ step.detail }}</small>
+          </li>
+        </ul>
       </div>
-
-      <div v-if="message1" :class="['message', message1Success ? 'success' : 'error']">
-        {{ message1 }}
-      </div>
-    </div>
-
-    <!-- Fichier 2 : Déclinaisons -->
-    <div class="import-section">
-      <h2>Fichier 2 — Déclinaisons et stock</h2>
-      <p class="description">
-        Colonnes attendues : reference, specificité (ou specificite), karazany, stock_initial, prix_vente_ttc
-      </p>
-
-      <div class="file-input-group">
-        <input
-          ref="file2Input"
-          type="file"
-          accept=".csv"
-          @change="handleFile2Change"
-          :disabled="isImporting2"
-          class="file-input"
-        />
-        <button
-          @click="importFile2"
-          :disabled="!file2 || isImporting2"
-          class="btn btn-import"
-        >
-          {{ isImporting2 ? 'Import en cours...' : 'Importer Fichier 2' }}
-        </button>
-      </div>
-
-      <div v-if="message2" :class="['message', message2Success ? 'success' : 'error']">
-        {{ message2 }}
-      </div>
-    </div>
-
-    <!-- Fichier 3 : Clients et Commandes -->
-    <div class="import-section">
-      <h2>Fichier 3 — Clients et commandes</h2>
-      <p class="description">
-        Colonnes attendues : date, nom, email, pwd, adresse, achat, etat
-      </p>
-
-      <div class="file-input-group">
-        <input
-          ref="file3Input"
-          type="file"
-          accept=".csv"
-          @change="handleFile3Change"
-          :disabled="isImporting3"
-          class="file-input"
-        />
-        <button
-          @click="importFile3"
-          :disabled="!file3 || isImporting3"
-          class="btn btn-import"
-        >
-          {{ isImporting3 ? 'Import en cours...' : 'Importer Fichier 3' }}
-        </button>
-      </div>
-
-      <div v-if="message3" :class="['message', message3Success ? 'success' : 'error']">
-        {{ message3 }}
-      </div>
-    </div>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref } from 'vue';
 import { parseCSV, detectFileType } from '../utils/csvParser';
-import { importProduits, importDeclinaisons, importCommandes } from '../services/import.service';
+import {
+  extractImagesFromZip,
+  importProduits,
+  importImages,
+  importDeclinaisons,
+  importCommandes,
+} from '../services/import.service';
 import { ImportTransaction } from '../services/transactionManager';
 
-// Transaction pour tous les imports
-let transaction: ImportTransaction | null = null;
-
-// État des fichiers
 const file1 = ref<File | null>(null);
 const file2 = ref<File | null>(null);
 const file3 = ref<File | null>(null);
+const zipFile = ref<File | null>(null);
 
-// État d'import
-const isImporting1 = ref(false);
-const isImporting2 = ref(false);
-const isImporting3 = ref(false);
 const isImportingAll = ref(false);
-
-// Messages
-const message1 = ref('');
-const message1Success = ref(false);
-const message2 = ref('');
-const message2Success = ref(false);
-const message3 = ref('');
-const message3Success = ref(false);
 const globalMessage = ref('');
-const globalMessageSuccess = ref(false);
+const globalMessageStatus = ref<'info' | 'success' | 'error'>('info');
 
-// Refs pour inputs
 const file1Input = ref<HTMLInputElement | null>(null);
 const file2Input = ref<HTMLInputElement | null>(null);
 const file3Input = ref<HTMLInputElement | null>(null);
+const zipInput = ref<HTMLInputElement | null>(null);
 
-/**
- * Handlers pour changement de fichier
- */
-function handleFile1Change(event: Event): void {
+type ImportStepStatus = 'waiting' | 'running' | 'success' | 'failed' | 'rolledback';
+type ImportStepKey = 'validation' | 'fichier1' | 'images' | 'fichier2' | 'fichier3' | 'rollback';
+
+interface ImportStepUi {
+  key: ImportStepKey;
+  label: string;
+  status: ImportStepStatus;
+  detail: string;
+}
+
+const initialImportSteps: ImportStepUi[] = [
+  { key: 'validation', label: 'Verification des 4 fichiers', status: 'waiting', detail: '' },
+  { key: 'fichier1', label: 'Fichier 1 - Produits', status: 'waiting', detail: '' },
+  { key: 'images', label: 'Fichier 4 - Images', status: 'waiting', detail: '' },
+  { key: 'fichier2', label: 'Fichier 2 - Declinaisons / stock', status: 'waiting', detail: '' },
+  { key: 'fichier3', label: 'Fichier 3 - Clients / paniers / commandes', status: 'waiting', detail: '' },
+  { key: 'rollback', label: 'Annulation transactionnelle', status: 'waiting', detail: '' },
+];
+
+const importSteps = ref<ImportStepUi[]>(initialImportSteps.map((step) => ({ ...step })));
+const showImportProgress = ref(false);
+
+function handleFileChange(event: Event, fileNumber: 1 | 2 | 3 | 4): void {
   const input = event.target as HTMLInputElement;
-  file1.value = input.files?.[0] || null;
+  const selected = input.files?.[0] || null;
+
+  if (fileNumber === 1) file1.value = selected;
+  if (fileNumber === 2) file2.value = selected;
+  if (fileNumber === 3) file3.value = selected;
+  if (fileNumber === 4) zipFile.value = selected;
 }
 
-function handleFile2Change(event: Event): void {
-  const input = event.target as HTMLInputElement;
-  file2.value = input.files?.[0] || null;
+function resetImportProgress(): void {
+  importSteps.value = initialImportSteps.map((step) => ({ ...step }));
+  showImportProgress.value = true;
 }
 
-function handleFile3Change(event: Event): void {
-  const input = event.target as HTMLInputElement;
-  file3.value = input.files?.[0] || null;
+function setStepStatus(key: ImportStepKey, status: ImportStepStatus, detail = ''): void {
+  const step = importSteps.value.find((item) => item.key === key);
+  if (!step) return;
+  step.status = status;
+  step.detail = detail;
 }
 
-/**
- * Reset global message
- */
-function resetGlobalMessage(): void {
-  globalMessage.value = '';
-  globalMessageSuccess.value = false;
+function markImportedStepsRolledBack(): void {
+  importSteps.value.forEach((step) => {
+    if (['fichier1', 'fichier2', 'fichier3', 'images'].includes(step.key) && step.status === 'success') {
+      step.status = 'rolledback';
+      step.detail = 'Import annule: les donnees creees ont ete supprimees ou restaurees.';
+    }
+  });
 }
 
-/**
- * Import tous les fichiers en une seule transaction (TOUT OU RIEN)
- */
+function getStepStatusLabel(step: ImportStepUi): string {
+  if (step.status === 'success' && step.key === 'validation') return 'Valide';
+  if (step.status === 'success' && step.key === 'rollback') return 'Termine';
+
+  const labels: Record<ImportStepStatus, string> = {
+    waiting: 'En attente',
+    running: 'En cours',
+    success: 'Importe',
+    failed: 'Erreur',
+    rolledback: 'Annule',
+  };
+  return labels[step.status];
+}
+
+function formatDuration(startTime: number): string {
+  const seconds = Math.max(1, Math.round((performance.now() - startTime) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return remainingSeconds ? `${minutes}min ${remainingSeconds}s` : `${minutes}min`;
+}
+
+function parseTypedCsv(file: File, expectedType: 'produits' | 'declinaisons' | 'commandes') {
+  return file.text().then((content) => {
+    const data = parseCSV(content);
+    if (data.length < 2) {
+      throw new Error(`${file.name}: au moins un en-tete et une ligne sont requis`);
+    }
+
+    const headers = data[0];
+    const detected = detectFileType(headers);
+    if (detected !== expectedType) {
+      throw new Error(`${file.name}: format invalide (${detected})`);
+    }
+
+    return { headers, rows: data.slice(1) };
+  });
+}
+
+function clearFiles(): void {
+  file1.value = null;
+  file2.value = null;
+  file3.value = null;
+  zipFile.value = null;
+  if (file1Input.value) file1Input.value.value = '';
+  if (file2Input.value) file2Input.value.value = '';
+  if (file3Input.value) file3Input.value.value = '';
+  if (zipInput.value) zipInput.value.value = '';
+}
+
 async function importAll(): Promise<void> {
-  if (!file1.value || !file2.value || !file3.value) {
-    globalMessage.value = '❌ Tous les fichiers doivent être sélectionnés';
-    globalMessageSuccess.value = false;
+  if (!file1.value || !file2.value || !file3.value || !zipFile.value) {
+    globalMessage.value = 'Les 4 fichiers sont requis.';
+    globalMessageStatus.value = 'error';
     return;
   }
 
+  resetImportProgress();
   isImportingAll.value = true;
-  resetGlobalMessage();
-  
-  // Créer une nouvelle transaction
-  transaction = new ImportTransaction();
+  const importStartTime = performance.now();
+  globalMessage.value = 'Import en cours: les 4 fichiers seront valides ensemble.';
+  globalMessageStatus.value = 'info';
+  let currentStep: ImportStepKey = 'validation';
+
+  const transaction = new ImportTransaction();
 
   try {
-    // === FICHIER 1 ===
-    console.log('\n📦 === ÉTAPE 1 : FICHIER 1 (PRODUITS) ===\n');
-    const content1 = await file1.value.text();
-    const data1 = parseCSV(content1);
+    setStepStatus('validation', 'running', 'Lecture et controle des formats CSV/ZIP.');
+    const [csv1, csv2, csv3, images] = await Promise.all([
+      parseTypedCsv(file1.value, 'produits'),
+      parseTypedCsv(file2.value, 'declinaisons'),
+      parseTypedCsv(file3.value, 'commandes'),
+      extractImagesFromZip(zipFile.value),
+    ]);
+    setStepStatus('validation', 'success', 'Les 4 fichiers sont lisibles et au bon format.');
 
-    if (data1.length < 2) {
-      throw new Error('Fichier 1 : au moins 1 en-tête et 1 ligne requise');
-    }
+    currentStep = 'fichier1';
+    setStepStatus('fichier1', 'running', 'Import des produits en cours.');
+    await importProduits(csv1.rows, csv1.headers, transaction);
+    setStepStatus('fichier1', 'success', `${csv1.rows.length} ligne(s) traitee(s).`);
 
-    const headers1 = data1[0];
-    const fileType1 = detectFileType(headers1);
+    currentStep = 'images';
+    setStepStatus('images', 'running', 'Import des images produits en cours.');
+    await importImages(images, transaction);
+    setStepStatus('images', 'success', `${Object.keys(images).length} image(s) lue(s) dans le ZIP.`);
 
-    if (fileType1 !== 'produits') {
-      throw new Error(
-        'Fichier 1 : colonnes invalides. Attendues: nom, reference, prix_ttc, Taxe, categorie'
-      );
-    }
+    currentStep = 'fichier2';
+    setStepStatus('fichier2', 'running', 'Import des declinaisons et stocks en cours.');
+    await importDeclinaisons(csv2.rows, csv2.headers, transaction);
+    setStepStatus('fichier2', 'success', `${csv2.rows.length} ligne(s) traitee(s).`);
 
-    const rows1 = data1.slice(1);
-    await importProduits(rows1, headers1, transaction);
+    currentStep = 'fichier3';
+    setStepStatus('fichier3', 'running', 'Import des clients, paniers et commandes en cours.');
+    await importCommandes(csv3.rows, csv3.headers, transaction);
+    setStepStatus('fichier3', 'success', `${csv3.rows.length} ligne(s) traitee(s).`);
+    setStepStatus('rollback', 'success', 'Aucun rollback necessaire.');
 
-    // === FICHIER 2 ===
-    console.log('\n📦 === ÉTAPE 2 : FICHIER 2 (DÉCLINAISONS) ===\n');
-    const content2 = await file2.value.text();
-    const data2 = parseCSV(content2);
-
-    if (data2.length < 2) {
-      throw new Error('Fichier 2 : au moins 1 en-tête et 1 ligne requise');
-    }
-
-    const headers2 = data2[0];
-    const fileType2 = detectFileType(headers2);
-
-    if (fileType2 !== 'declinaisons') {
-      throw new Error(
-        'Fichier 2 : colonnes invalides. Attendues: reference, specificite, karazany, stock_initial'
-      );
-    }
-
-    const rows2 = data2.slice(1);
-    await importDeclinaisons(rows2, headers2, transaction);
-
-    // === FICHIER 3 ===
-    console.log('\n📦 === ÉTAPE 3 : FICHIER 3 (COMMANDES) ===\n');
-    const content3 = await file3.value.text();
-    const data3 = parseCSV(content3);
-
-    if (data3.length < 2) {
-      throw new Error('Fichier 3 : au moins 1 en-tête et 1 ligne requise');
-    }
-
-    const headers3 = data3[0];
-    const fileType3 = detectFileType(headers3);
-
-    if (fileType3 !== 'commandes') {
-      throw new Error(
-        'Fichier 3 : colonnes invalides. Attendues: date, nom, email, pwd, adresse, achat, etat'
-      );
-    }
-
-    const rows3 = data3.slice(1);
-    await importCommandes(rows3, headers3, transaction);
-
-    // === SUCCÈS ===
     const status = transaction.getStatus();
     transaction.logReport();
-    
-    globalMessage.value = `✅ SUCCÈS! ${status.totalResourcesCreated} ressources créées en 3 étapes`;
-    globalMessageSuccess.value = true;
 
-    // Réinitialiser les fichiers
-    file1.value = null;
-    file2.value = null;
-    file3.value = null;
-    if (file1Input.value) file1Input.value.value = '';
-    if (file2Input.value) file2Input.value.value = '';
-    if (file3Input.value) file3Input.value.value = '';
-
+    globalMessage.value = `Import reussi en ${formatDuration(importStartTime)}: ${status.totalResourcesCreated} ressources traitees.`;
+    globalMessageStatus.value = 'success';
+    clearFiles();
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    
-    // Marquer l'étape en cours comme échouée et déclencher rollback
-    if (transaction) {
-      const failedStep = transaction.getStatus().steps.find((s) => s.status === 'pending') ?? transaction.getStatus().steps[transaction.getStatus().steps.length - 1];
-      if (failedStep) {
-        await transaction.markStepFailed(failedStep.name, errorMsg);
-      }
-      
-      // Afficher le rapport
-      transaction.logReport();
-    }
+    const message = error instanceof Error ? error.message : String(error);
+    const status = transaction.getStatus();
+    const failedStep = status.steps.find((step) => step.status === 'pending')?.name
+      || status.steps[status.steps.length - 1]?.name
+      || currentStep;
+    const failedStepKey = (['fichier1', 'fichier2', 'fichier3', 'images'].includes(failedStep)
+      ? failedStep
+      : currentStep) as ImportStepKey;
 
-    globalMessage.value = `❌ Erreur: ${errorMsg}. Rollback transactionnel effectué!`;
-    globalMessageSuccess.value = false;
-    console.error('Erreur import:', error);
+    setStepStatus(failedStepKey, 'failed', message);
+    setStepStatus('rollback', 'running', 'Erreur detectee: annulation de tout ce qui a deja ete importe.');
+    if (failedStep === currentStep && !status.steps.some((step) => step.name === failedStep)) {
+      transaction.registerStep(failedStep);
+    }
+    await transaction.markStepFailed(failedStep, message);
+    markImportedStepsRolledBack();
+    setStepStatus('rollback', 'success', 'Rollback termine: les 4 fichiers ne sont pas valides partiellement.');
+    transaction.logReport();
+    const failedLabel = importSteps.value.find((step) => step.key === failedStepKey)?.label || failedStepKey;
+    globalMessage.value = `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Aucun import partiel n'a ete conserve. Details: ${message}`;
+    globalMessageStatus.value = 'error';
   } finally {
     isImportingAll.value = false;
-  }
-}
-
-/**
- * Import Fichier 1 uniquement (mode individuel, SANS transaction)
- */
-async function importFile1(): Promise<void> {
-  if (!file1.value) return;
-
-  isImporting1.value = true;
-  message1.value = '';
-
-  try {
-    const content = await file1.value.text();
-    const data = parseCSV(content);
-
-    if (data.length < 2) {
-      throw new Error('Le fichier doit contenir au moins 1 en-tête et 1 ligne de données');
-    }
-
-    const headers = data[0];
-    const fileType = detectFileType(headers);
-
-    if (fileType !== 'produits') {
-      throw new Error(
-        'Ce fichier n\'a pas le bon format. Il doit contenir les colonnes : nom, reference, prix_ttc, Taxe, categorie'
-      );
-    }
-
-    const rows = data.slice(1);
-    // Mode individuel : créer une transaction temporaire
-    const tempTransaction = new ImportTransaction();
-    await importProduits(rows, headers, tempTransaction);
-    tempTransaction.markStepSuccess('fichier1');
-    tempTransaction.logReport();
-
-    message1.value = `✅ Import terminé : ${rows.length} lignes traitées`;
-    message1Success.value = true;
-
-    // Réinitialiser l'input
-    if (file1Input.value) {
-      file1Input.value.value = '';
-    }
-    file1.value = null;
-  } catch (error) {
-    message1.value = `❌ Erreur : ${error instanceof Error ? error.message : String(error)}`;
-    message1Success.value = false;
-    console.error('Erreur import fichier 1:', error);
-  } finally {
-    isImporting1.value = false;
-  }
-}
-
-/**
- * Import Fichier 2 uniquement (mode individuel, SANS transaction)
- */
-async function importFile2(): Promise<void> {
-  if (!file2.value) return;
-
-  isImporting2.value = true;
-  message2.value = '';
-
-  try {
-    const content = await file2.value.text();
-    const data = parseCSV(content);
-
-    if (data.length < 2) {
-      throw new Error('Le fichier doit contenir au moins 1 en-tête et 1 ligne de données');
-    }
-
-    const headers = data[0];
-    const fileType = detectFileType(headers);
-
-    if (fileType !== 'declinaisons') {
-      throw new Error(
-        'Ce fichier n\'a pas le bon format. Il doit contenir les colonnes : reference, specificite, karazany, stock_initial'
-      );
-    }
-
-    const rows = data.slice(1);
-    // Mode individuel : créer une transaction temporaire
-    const tempTransaction = new ImportTransaction();
-    await importDeclinaisons(rows, headers, tempTransaction);
-    tempTransaction.markStepSuccess('fichier2');
-    tempTransaction.logReport();
-
-    message2.value = `✅ Import terminé : ${rows.length} lignes traitées`;
-    message2Success.value = true;
-
-    // Réinitialiser l'input
-    if (file2Input.value) {
-      file2Input.value.value = '';
-    }
-    file2.value = null;
-  } catch (error) {
-    message2.value = `❌ Erreur : ${error instanceof Error ? error.message : String(error)}`;
-    message2Success.value = false;
-    console.error('Erreur import fichier 2:', error);
-  } finally {
-    isImporting2.value = false;
-  }
-}
-
-/**
- * Import Fichier 3 uniquement (mode individuel, SANS transaction)
- */
-async function importFile3(): Promise<void> {
-  if (!file3.value) return;
-
-  isImporting3.value = true;
-  message3.value = '';
-
-  try {
-    const content = await file3.value.text();
-    const data = parseCSV(content);
-
-    if (data.length < 2) {
-      throw new Error('Le fichier doit contenir au moins 1 en-tête et 1 ligne de données');
-    }
-
-    const headers = data[0];
-    const fileType = detectFileType(headers);
-
-    if (fileType !== 'commandes') {
-      throw new Error(
-        'Ce fichier n\'a pas le bon format. Il doit contenir les colonnes : date, nom, email, pwd, adresse, achat, etat'
-      );
-    }
-
-    const rows = data.slice(1);
-    // Mode individuel : créer une transaction temporaire
-    const tempTransaction = new ImportTransaction();
-    await importCommandes(rows, headers, tempTransaction);
-    tempTransaction.markStepSuccess('fichier3');
-    tempTransaction.logReport();
-
-    message3.value = `✅ Import terminé : ${rows.length} lignes traitées`;
-    message3Success.value = true;
-
-    // Réinitialiser l'input
-    if (file3Input.value) {
-      file3Input.value.value = '';
-    }
-    file3.value = null;
-  } catch (error) {
-    message3.value = `❌ Erreur : ${error instanceof Error ? error.message : String(error)}`;
-    message3Success.value = false;
-    console.error('Erreur import fichier 3:', error);
-  } finally {
-    isImporting3.value = false;
   }
 }
 </script>
@@ -464,66 +285,125 @@ h1 {
   border: 1px solid #ddd;
   border-radius: 8px;
   padding: 2rem;
-  margin-bottom: 2rem;
-}
-
-.import-section h2 {
-  font-size: 1.3rem;
-  margin-bottom: 0.5rem;
-  color: #444;
 }
 
 .description {
-  font-size: 0.9rem;
   color: #666;
-  margin-bottom: 1rem;
-  font-style: italic;
+  margin-bottom: 1.5rem;
 }
 
-.file-input-group {
-  display: flex;
+.file-grid {
+  display: grid;
   gap: 1rem;
-  align-items: center;
-  margin-bottom: 1rem;
+  margin-bottom: 1.5rem;
 }
 
-.file-input {
-  flex: 1;
-  padding: 0.5rem;
+label {
+  display: grid;
+  gap: 0.4rem;
+  font-weight: 600;
+}
+
+input {
+  padding: 0.55rem;
   border: 1px solid #ccc;
   border-radius: 4px;
-  font-size: 0.9rem;
+  background: white;
 }
 
 .btn {
   padding: 0.75rem 1.5rem;
-  font-size: 1rem;
   border: none;
   border-radius: 4px;
   cursor: pointer;
   font-weight: 600;
-  transition: all 0.3s ease;
-  white-space: nowrap;
 }
 
-.btn-import {
-  background-color: #007bff;
+.btn-import-all {
+  background: #007bff;
   color: white;
 }
 
-.btn-import:hover:not(:disabled) {
-  background-color: #0056b3;
-}
-
-.btn-import:disabled {
-  background-color: #6c757d;
+.btn:disabled {
+  background: #6c757d;
   cursor: not-allowed;
   opacity: 0.7;
+}
+
+.import-progress {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: white;
+}
+
+.progress-title {
+  margin: 0 0 0.75rem;
+  font-weight: 700;
+  color: #333;
+}
+
+.progress-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.progress-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.25rem 0.75rem;
+  align-items: center;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid #e2e2e2;
+  border-left: 4px solid #b8b8b8;
+  border-radius: 4px;
+  background: #fafafa;
+}
+
+.progress-label {
+  min-width: 0;
+  font-weight: 600;
+  color: #333;
+}
+
+.progress-status {
+  font-weight: 700;
+  color: #555;
+}
+
+.progress-detail {
+  grid-column: 1 / -1;
+  color: #666;
+}
+
+.progress-item.running {
+  border-left-color: #007bff;
+  background: #f0f7ff;
+}
+
+.progress-item.success {
+  border-left-color: #28a745;
+  background: #f3fbf5;
+}
+
+.progress-item.failed {
+  border-left-color: #dc3545;
+  background: #fff5f5;
+}
+
+.progress-item.rolledback {
+  border-left-color: #fd7e14;
+  background: #fff8f0;
 }
 
 .message {
   padding: 1rem;
   border-radius: 4px;
+  margin-bottom: 1rem;
   font-weight: 600;
 }
 
@@ -531,6 +411,12 @@ h1 {
   background-color: #d4edda;
   color: #155724;
   border: 1px solid #c3e6cb;
+}
+
+.message.info {
+  background-color: #e7f3ff;
+  color: #084b83;
+  border: 1px solid #b7dafc;
 }
 
 .message.error {

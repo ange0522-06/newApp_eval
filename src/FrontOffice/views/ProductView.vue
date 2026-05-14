@@ -87,13 +87,24 @@
         </div>
 
         <!-- Bouton ajouter au panier -->
-        <button
-          class="btn-cart"
-          :disabled="currentStock === 0"
-          @click="addToCart"
-        >
-          {{ currentStock === 0 ? 'Rupture de stock' : 'Ajouter au panier' }}
-        </button>
+        <div class="product-actions">
+          <button
+            class="btn-cart"
+            :disabled="currentStock === 0"
+            @click="addToCart"
+          >
+            {{ currentStock === 0 ? 'Rupture de stock' : 'Ajouter au panier' }}
+          </button>
+
+          <!-- Bouton continuer l'achat (ajoute et retourne à l'accueil) -->
+          <button
+            class="btn-continue"
+            :disabled="currentStock === 0"
+            @click="continueShopping"
+          >
+            Continuer l'achat
+          </button>
+        </div>
 
         <!-- Message confirmation ajout panier -->
         <p v-if="addedToCart" class="product-detail__confirmation">
@@ -111,6 +122,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getProductById } from '../services/product.service'
 import type { ProductDetail, Combination, LoadingState } from '@/FrontOffice/types/product.types'
+import { useCartStore } from '../stores/cart.store'
 
 // ─── Route et Router ─────────────────────────────────────────────────────────
 
@@ -276,18 +288,43 @@ function addToCart(): void {
   if (!product.value) return
   if (currentStock.value === 0) return
 
-  // TODO : remplacer par cartStore.addItem() quand cart.store.ts sera créé
-  console.log('Ajout au panier :', {
-    product: product.value,
-    combination: selectedCombination.value,
+  const cart = useCartStore()
+
+  const item = {
+    productId: product.value.id,
+    combinationId: selectedCombination.value?.id,
+    name: product.value.name,
+    imageUrl: product.value.imageUrl,
+    price: selectedCombination.value ? selectedCombination.value.price : product.value.priceTTC,
     quantity: quantity.value
-  })
+  }
+
+  cart.addItem(item)
 
   // Afficher la confirmation pendant 2 secondes
   addedToCart.value = true
   setTimeout(() => {
     addedToCart.value = false
   }, 2000)
+}
+
+function continueShopping(): void {
+  if (!product.value) return
+  if (currentStock.value === 0) return
+
+  const cart = useCartStore()
+  const item = {
+    productId: product.value.id,
+    combinationId: selectedCombination.value?.id,
+    name: product.value.name,
+    imageUrl: product.value.imageUrl,
+    price: selectedCombination.value ? selectedCombination.value.price : product.value.priceTTC,
+    quantity: quantity.value
+  }
+
+  cart.addItem(item)
+  // retourner à la liste produits / home pour continuer les achats
+  router.push('/home')
 }
 
 /**

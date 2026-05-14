@@ -1,7 +1,7 @@
 <template>
   <div class="login-container">
     <div class="login-box">
-      <h1>🔐 Back-Office PrestaShop</h1>
+      <h1>Back-Office PrestaShop</h1>
       <p class="subtitle">Connectez-vous avec vos identifiants administrateur</p>
 
       <form @submit.prevent="handleLogin" class="login-form">
@@ -59,7 +59,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue';
-import { useRouter } from 'vue-router';
+import { useRouter, useRoute } from 'vue-router';
 import { useAuth } from '../composables/useAuth';
 
 const router = useRouter();
@@ -68,6 +68,8 @@ const { login, errorMessage, isLoading, clearError } = useAuth();
 // Valeurs par défaut pré-remplies
 const email = ref<string>('angenierazafimahatratra@gmail.com');
 const password = ref<string>('prestashop');
+
+const route = useRoute()
 
 async function handleLogin() {
   clearError();
@@ -79,8 +81,9 @@ async function handleLogin() {
   const success = await login(email.value, password.value);
 
   if (success) {
-    // Redirection vers la page d'import après connexion réussie
-    router.push('/back/import');
+    // Si une redirection est demandée (ex: /checkout), respecter
+    const redirect = (route.query.redirect as string) || '/back/import'
+    router.push(redirect)
   }
 }
 </script>

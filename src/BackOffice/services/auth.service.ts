@@ -9,19 +9,12 @@ interface AuthResponse {
 }
 
 /**
- * Service d'authentification via WebService PrestaShop
- * Utilise l'API avec authentification Basic (MD5)
+ * Service d'authentification back-office.
+ * Le mot de passe employe est verifie cote PHP avec le systeme de hash PrestaShop.
  */
 class AuthService {
   /**
-   * Hash le password en MD5
-   */
-  private hashPassword(password: string): string {
-    return CryptoJS.MD5(password).toString();
-  }
-
-  /**
-   * Authentifie l'utilisateur via PrestaShop WebService
+   * Authentifie l'utilisateur via la table employee PrestaShop.
    */
   async login(email: string, password: string): Promise<AuthResponse> {
     try {
@@ -29,30 +22,30 @@ class AuthService {
         return { success: false, message: ERROR_MESSAGES.MISSING_CREDENTIALS };
       }
 
-      const hashedPassword = this.hashPassword(password);
-      const endpoint = `${API_CONFIG.BASE_URL}/?output=JSON`;
-
-      const response = await fetch(endpoint, {
-        method: 'GET',
+      const response = await fetch(API_CONFIG.BO_LOGIN_URL, {
+        method: 'POST',
         headers: {
-          'Authorization': `Basic ${btoa(`${email}:${hashedPassword}`)}`,
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({ email, password }),
       });
 
-      if (response.ok) {
-        const token = this.hashPassword(`${email}:${hashedPassword}:${Date.now()}`);
-        this.storeCredentials(email, token);
-        return { success: true, token, email };
+      const data = await response.json().catch(() => null);
+
+      if (response.ok && data?.success && data?.employee?.email) {
+        const employeeEmail = String(data.employee.email);
+        const token = CryptoJS.SHA256(`${employeeEmail}:${Date.now()}:${Math.random()}`).toString();
+        this.storeCredentials(employeeEmail, token);
+        return { success: true, token, email: employeeEmail };
       }
 
       if (response.status === 401) {
-        return { success: false, message: ERROR_MESSAGES.INVALID_CREDENTIALS };
+        return { success: false, message: data?.message || ERROR_MESSAGES.INVALID_CREDENTIALS };
       }
 
       return {
         success: false,
-        message: `${ERROR_MESSAGES.SERVER_ERROR}: ${response.status}`,
+        message: data?.message || `${ERROR_MESSAGES.SERVER_ERROR}: ${response.status}`,
       };
     } catch (error) {
       console.error('Auth error:', error);

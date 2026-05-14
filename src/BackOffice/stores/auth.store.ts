@@ -1,11 +1,12 @@
 // BackOffice/stores/auth.store.ts
 import { defineStore } from 'pinia';
 import { authService} from '../services/auth.service';
+import { STORAGE_KEYS } from '../config/config';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
-    userEmail: localStorage.getItem('auth_email') || null,
-    authToken: localStorage.getItem('auth_token') || null,
+    userEmail: localStorage.getItem(STORAGE_KEYS.EMAIL) || null,
+    authToken: localStorage.getItem(STORAGE_KEYS.TOKEN) || null,
     isLoading: false,
     errorMessage: '',
   }),
@@ -14,7 +15,7 @@ export const useAuthStore = defineStore('auth', {
     // ✅ Vérification correcte de l'authentification
     isAuthenticated: (state) => {
       const hasAuth = state.authToken !== null && state.userEmail !== null;
-      const storageFlag = localStorage.getItem('auth_authenticated') === 'true';
+      const storageFlag = localStorage.getItem(STORAGE_KEYS.AUTH) === 'true';
       return hasAuth && storageFlag;
     },
   },
@@ -31,9 +32,9 @@ export const useAuthStore = defineStore('auth', {
         if (response.success && response.token && response.email) {
           this.userEmail = response.email;
           this.authToken = response.token;
-          localStorage.setItem('auth_authenticated', 'true');
-          localStorage.setItem('auth_email', response.email);
-          localStorage.setItem('auth_token', response.token);
+          localStorage.setItem(STORAGE_KEYS.AUTH, 'true');
+          localStorage.setItem(STORAGE_KEYS.EMAIL, response.email);
+          localStorage.setItem(STORAGE_KEYS.TOKEN, response.token);
           return true;
         } else {
           this.errorMessage = response.message || 'Échec de connexion';
@@ -51,9 +52,9 @@ export const useAuthStore = defineStore('auth', {
       this.userEmail = null;
       this.authToken = null;
       this.errorMessage = '';
-      localStorage.removeItem('auth_authenticated');
-      localStorage.removeItem('auth_email');
-      localStorage.removeItem('auth_token');
+      localStorage.removeItem(STORAGE_KEYS.AUTH);
+      localStorage.removeItem(STORAGE_KEYS.EMAIL);
+      localStorage.removeItem(STORAGE_KEYS.TOKEN);
     },
 
     clearError(): void {

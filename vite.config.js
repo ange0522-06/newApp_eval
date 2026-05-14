@@ -14,6 +14,12 @@ export default defineConfig(({ mode }) => {
     ],
     server: {
       proxy: {
+        '/newapp-api': {
+          target: 'http://localhost',
+          changeOrigin: true,
+          secure: false,
+          rewrite: (path) => path.replace('/newapp-api', '/e-commerce/newApp/api'),
+        },
         '/prestashop-api': {
           target: 'http://localhost',   // ← http au lieu de https
           changeOrigin: true,

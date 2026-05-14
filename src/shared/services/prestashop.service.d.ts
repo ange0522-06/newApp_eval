@@ -25,7 +25,7 @@ export function getOne(resource: string, id: string): Promise<string>
  * @param id - ID de la ressource
  * @returns Texte XML brut de la ressource
  */
-export function getOneXml(resource: string, id: string): Promise<string>
+export function getOneXml(resource: string, id: string, options?: { silent404?: boolean }): Promise<string | null>
 
 /**
  * Crée une nouvelle ressource via POST
@@ -51,3 +51,5 @@ export function putXML(resource: string, id: string, xmlBody: string): Promise<b
  * @returns true si succès, false sinon
  */
 export function deleteResource(resource: string, id: string): Promise<boolean>
+
+export function uploadProductImage(productId: string | number, file: File | Blob): Promise<{ success: boolean, id?: string, error?: string }>

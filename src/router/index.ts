@@ -6,10 +6,14 @@ import LoginView from '../BackOffice/views/LoginView.vue';
 import ImportView from '../BackOffice/views/ImportView.vue';
 import OrdersView from '../BackOffice/views/OrdersView.vue';
 import ResetView from '../BackOffice/views/ResetView.vue';
+import ForcedIdsView from '../BackOffice/views/ForcedIdsView.vue';
 
 // Front-Office Views
 import HomeView from '../FrontOffice/views/HomeView.vue';
 import ProductView from '../FrontOffice/views/ProductView.vue';
+import CheckoutView from '../FrontOffice/views/CheckoutView.vue';
+import CustomerLogin from '../FrontOffice/views/CustomerLogin.vue';
+import CustomerRegister from '../FrontOffice/views/CustomerRegister.vue';
 
 // Shared Views
 import LandingView from '../shared/views/LandingView.vue';
@@ -41,6 +45,27 @@ const routes: RouteRecordRaw[] = [
     path: '/product/:id',
     name: 'Product',
     component: ProductView,
+    meta: { requiresAuth: false },
+  },
+
+  {
+    path: '/checkout',
+    name: 'Checkout',
+    component: CheckoutView,
+    meta: { requiresAuth: true },
+  },
+
+  // Front-office customer auth
+  {
+    path: '/login',
+    name: 'CustomerLogin',
+    component: CustomerLogin,
+    meta: { requiresAuth: false },
+  },
+  {
+    path: '/register',
+    name: 'CustomerRegister',
+    component: CustomerRegister,
     meta: { requiresAuth: false },
   },
 
@@ -98,11 +123,19 @@ const router = createRouter({
 // ✅ CORRECTION : Suppression du paramètre "next"
 router.beforeEach((to, from) => {
   const authStore = useAuthStore();
-  const isAuthenticated = authStore.isAuthenticated;
+  const isBackOfficeRoute = to.path.startsWith('/back');
+  const isBackOfficeAuthenticated = authStore.isAuthenticated;
+  const isCustomerAuthenticated =
+    localStorage.getItem('auth_authenticated') === 'true' &&
+    localStorage.getItem('auth_email') !== null &&
+    localStorage.getItem('auth_token') !== null;
+  const isAuthenticated = isBackOfficeRoute ? isBackOfficeAuthenticated : isCustomerAuthenticated;
   const requiresAuth = to.meta.requiresAuth !== false; // Par défaut, toute route nécessite l'auth
 
   console.log(`Navigation vers ${to.path}`, {
     isAuthenticated,
+    isBackOfficeAuthenticated,
+    isCustomerAuthenticated,
     requiresAuth,
     meta: to.meta,
   });
@@ -110,15 +143,20 @@ router.beforeEach((to, from) => {
   // Si la route nécessite authentification et l'utilisateur n'est pas auth
   if (requiresAuth && !isAuthenticated) {
     console.log(`❌ Route ${to.path} nécessite auth, redirection vers login`);
-    return {
-      path: '/back/login',
-      query: { redirect: to.fullPath },
-    };
+    // Si la route demandée est dans le BackOffice, rediriger vers /back/login
+    if (isBackOfficeRoute) {
+      return { path: '/back/login', query: { redirect: to.fullPath } }
+    }
+    // Sinon, rediriger vers le login front-office
+    return { path: '/login', query: { redirect: to.fullPath } }
   }
   // Si l'utilisateur est auth et essaie d'accéder au login
-  else if (to.path === '/back/login' && isAuthenticated) {
+  else if (to.path === '/back/login' && isBackOfficeAuthenticated) {
     console.log(`✓ User déjà auth, redirection vers import`);
     return '/back/import';
+  } else if (to.path === '/login' && isCustomerAuthenticated) {
+    console.log(`✓ Client déjà connecté, redirection vers home`);
+    return '/home';
   }
   // Sinon, continuer normalement
   else {

@@ -7,11 +7,12 @@
  * - Chaque fichier = étape
  */
 
-import { deleteResource } from '../../shared/services/prestashop.service.js';
+import { deleteResource, putXML } from '../../shared/services/prestashop.service.js';
 
 export interface TransactionStep {
   name: string;
   resources: { resource: string; id: string }[];
+  updates: { resource: string; id: string; previousXml: string }[];
   status: 'pending' | 'success' | 'failed';
   error?: string;
 }
@@ -28,6 +29,7 @@ export class ImportTransaction {
       this.steps.set(stepName, {
         name: stepName,
         resources: [],
+        updates: [],
         status: 'pending',
       });
       this.stepOrder.push(stepName);
@@ -47,6 +49,17 @@ export class ImportTransaction {
 
     step.resources.push({ resource, id });
     console.log(`📦 Ressource tracée: ${stepName} → ${resource}/${id}`);
+  }
+
+  trackUpdate(stepName: string, resource: string, id: string, previousXml: string): void {
+    const step = this.steps.get(stepName);
+    if (!step) {
+      console.warn(`Etape ${stepName} non trouvee`);
+      return;
+    }
+
+    step.updates.push({ resource, id, previousXml });
+    console.log(`Mise a jour tracee: ${stepName} -> ${resource}/${id}`);
   }
 
   /**
@@ -88,7 +101,7 @@ export class ImportTransaction {
       const stepName = this.stepOrder[i];
       const step = this.steps.get(stepName);
 
-      if (!step || step.resources.length === 0) {
+      if (!step || (step.resources.length === 0 && step.updates.length === 0)) {
         continue;
       }
 
@@ -106,6 +119,20 @@ export class ImportTransaction {
           }
         } catch (error) {
           console.error(`   ✗ Erreur suppression ${resource}/${id}:`, error);
+        }
+      }
+
+      for (let j = step.updates.length - 1; j >= 0; j--) {
+        const { resource, id, previousXml } = step.updates[j];
+        try {
+          const success = await putXML(resource, id, previousXml);
+          if (success) {
+            console.log(`   Restaure: ${resource}/${id}`);
+          } else {
+            console.warn(`   Echec restauration: ${resource}/${id}`);
+          }
+        } catch (error) {
+          console.error(`   Erreur restauration ${resource}/${id}:`, error);
         }
       }
     }

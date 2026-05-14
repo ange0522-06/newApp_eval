@@ -9,6 +9,11 @@
 import { API_CONFIG } from '../../BackOffice/config/config';
 
 const BASE_URL = API_CONFIG.BASE_URL;
+const DEBUG_API = false;
+
+function debugLog(...args) {
+  if (DEBUG_API) console.log(...args);
+}
 
 /**
  * Récupère tous les IDs d'une ressource
@@ -18,7 +23,7 @@ const BASE_URL = API_CONFIG.BASE_URL;
 export async function getAllIds(resource) {
   try {
     const url = `${BASE_URL}/${resource}`;
-    console.log(`📡 Récupération des IDs pour: ${resource} | URL: ${url}`);
+    debugLog(`📡 Récupération des IDs pour: ${resource} | URL: ${url}`);
     
     const response = await fetch(url, {
       method: 'GET',
@@ -32,7 +37,7 @@ export async function getAllIds(resource) {
     }
 
     const xmlText = await response.text();
-    console.log(`📋 XML reçu (premiers 1000 chars):`, xmlText.substring(0, 1000));
+    debugLog(`📋 XML reçu (premiers 1000 chars):`, xmlText.substring(0, 1000));
     
     const parser = new DOMParser();
     const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
@@ -51,20 +56,20 @@ export async function getAllIds(resource) {
       // Afficher la structure du document pour débogage
       const prestashop = xmlDoc.querySelector('prestashop');
       if (prestashop) {
-        console.log(`📦 Éléments disponibles dans prestashop:`, Array.from(prestashop.children).map(el => el.tagName));
+        debugLog(`📦 Éléments disponibles dans prestashop:`, Array.from(prestashop.children).map(el => el.tagName));
       }
       return [];
     }
 
     // Récupérer le nom singulier de la ressource (products -> product, stock_availables -> stock_available)
     const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
-    console.log(`🔍 Cherche éléments singuliers: "${singular}"`);
+    debugLog(`🔍 Cherche éléments singuliers: "${singular}"`);
     
     // Chercher tous les éléments enfants directs avec le nom singulier
     const elements = resourceElement.querySelectorAll(`:scope > ${singular}`);
     const ids = Array.from(elements).map(el => el.getAttribute('id')).filter(id => id);
 
-    console.log(`✅ IDs trouvés pour ${resource}:`, ids);
+    debugLog(`✅ IDs trouvés pour ${resource}:`, ids);
     return ids;
   } catch (error) {
     console.error(`❌ Erreur getAllIds(${resource}):`, error);
@@ -125,7 +130,7 @@ export async function getOne(resource, id) {
       result[child.tagName] = child.textContent || '';
     });
 
-    console.log(`Données parsées pour ${resource}/${id}:`, result);
+    debugLog(`Données parsées pour ${resource}/${id}:`, result);
     return result;
   } catch (error) {
     console.error(`Erreur getOne(${resource}, ${id}):`, error);
@@ -140,7 +145,7 @@ export async function getOne(resource, id) {
  * @param {string|number} id - ID de la ressource
  * @returns {Promise<string>} Texte XML brut de la ressource
  */
-export async function getOneXml(resource, id) {
+export async function getOneXml(resource, id, options = {}) {
   try {
     const response = await fetch(`${BASE_URL}/${resource}/${id}`, {
       method: 'GET',
@@ -150,12 +155,18 @@ export async function getOneXml(resource, id) {
     })
 
     if (!response.ok) {
+      if (options.silent404 && response.status === 404) {
+        return null
+      }
       // Ne pas logger ici — laisser l'appelant gérer l'erreur silencieusement
       throw new Error(`HTTP ${response.status}: ${response.statusText}`)
     }
 
     return await response.text()
   } catch (error) {
+    if (options.silent404 && String(error?.message || error).includes('HTTP 404')) {
+      return null
+    }
     // Propager sans logger — preloadStocks() gère déjà le catch
     throw error
   }
@@ -179,7 +190,39 @@ export async function putXML(resource, id, xmlBody) {
     });
 
     if (!response.ok) {
-      console.warn(`PUT échoué: HTTP ${response.status}`);
+      const errorText = await response.text();
+      
+      // Try to parse XML error response
+      let parsedError = '';
+      try {
+        if (errorText) {
+          const parser = new DOMParser();
+          const xmlDoc = parser.parseFromString(errorText, 'text/xml');
+          
+          // Try to extract error from various PrestaShop error XML formats
+          const errorElements = [
+            xmlDoc.querySelector('error'),
+            xmlDoc.querySelector('message'),
+            xmlDoc.querySelector('errors > error'),
+            xmlDoc.querySelector('prestashop > error'),
+            xmlDoc.querySelector('prestashop > message')
+          ];
+          
+          for (const elem of errorElements) {
+            if (elem && elem.textContent) {
+              parsedError = elem.textContent;
+              break;
+            }
+          }
+        }
+      } catch (parseErr) {
+        // Not XML, use raw text
+        parsedError = errorText || '(Réponse vide du serveur)';
+      }
+      
+      const errorMsg = `PUT échoué pour ${resource}/${id}: HTTP ${response.status}. Details: ${parsedError || errorText.substring(0, 500)}`;
+      console.warn(errorMsg);
+      console.error(`Réponse complète du serveur:\n${errorText}`);
       return false;
     }
 
@@ -206,7 +249,39 @@ export async function deleteResource(resource, id) {
     });
 
     if (!response.ok) {
-      console.warn(`DELETE échoué: HTTP ${response.status}`);
+      const errorText = await response.text();
+      
+      // Try to parse XML error response
+      let parsedError = '';
+      try {
+        if (errorText) {
+          const parser = new DOMParser();
+          const xmlDoc = parser.parseFromString(errorText, 'text/xml');
+          
+          // Try to extract error from various PrestaShop error XML formats
+          const errorElements = [
+            xmlDoc.querySelector('error'),
+            xmlDoc.querySelector('message'),
+            xmlDoc.querySelector('errors > error'),
+            xmlDoc.querySelector('prestashop > error'),
+            xmlDoc.querySelector('prestashop > message')
+          ];
+          
+          for (const elem of errorElements) {
+            if (elem && elem.textContent) {
+              parsedError = elem.textContent;
+              break;
+            }
+          }
+        }
+      } catch (parseErr) {
+        // Not XML, use raw text
+        parsedError = errorText || '(Réponse vide du serveur)';
+      }
+      
+      const errorMsg = `DELETE échoué pour ${resource}/${id}: HTTP ${response.status}. Details: ${parsedError || errorText.substring(0, 500)}`;
+      console.warn(errorMsg);
+      console.error(`Réponse complète du serveur:\n${errorText}`);
       return false;
     }
 
@@ -225,6 +300,12 @@ export async function deleteResource(resource, id) {
  */
 export async function postXML(resource, xmlBody) {
   try {
+    // Log BEFORE sending
+    debugLog(`📤 [PRE-POST] Envoi à ${resource}: ${xmlBody.length} chars`);
+    if (resource === 'orders') {
+      debugLog(`📋 [FULL ORDER XML]:\n${xmlBody}`);
+    }
+    
     const response = await fetch(`${BASE_URL}/${resource}`, {
       method: 'POST',
       headers: {
@@ -235,8 +316,39 @@ export async function postXML(resource, xmlBody) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      const errorMsg = `HTTP ${response.status}: ${response.statusText}. Details: ${errorText.substring(0, 200)}`;
-      console.error(`POST échoué pour ${resource}:`, errorMsg);
+      
+      // Try to parse XML error response
+      let parsedError = '';
+      try {
+        if (errorText) {
+          const parser = new DOMParser();
+          const xmlDoc = parser.parseFromString(errorText, 'text/xml');
+          
+          // Try to extract error from various PrestaShop error XML formats
+          const errorElements = [
+            xmlDoc.querySelector('error'),
+            xmlDoc.querySelector('message'),
+            xmlDoc.querySelector('errors > error'),
+            xmlDoc.querySelector('prestashop > error'),
+            xmlDoc.querySelector('prestashop > message')
+          ];
+          
+          for (const elem of errorElements) {
+            if (elem && elem.textContent) {
+              parsedError = elem.textContent;
+              break;
+            }
+          }
+        }
+      } catch (parseErr) {
+        // Not XML, use raw text
+        parsedError = errorText || '(Réponse vide du serveur)';
+      }
+      
+      const errorMsg = `HTTP ${response.status}: ${response.statusText}. Details: ${parsedError || errorText.substring(0, 500)}`;
+      console.error(`❌ POST échoué pour ${resource}:`, errorMsg);
+      console.error(`📋 XML envoyé (COMPLET):\n${xmlBody}`);
+      console.error(`📨 Réponse serveur (${errorText.length} chars):\n${errorText || '(VIDE)'}`);
       return { success: false, error: errorMsg };
     }
 
@@ -249,7 +361,7 @@ export async function postXML(resource, xmlBody) {
       const idElement = xmlDoc.querySelector('id');
       const id = idElement?.textContent;
       
-      console.log(`POST succès pour ${resource}, ID: ${id}`);
+      debugLog(`POST succès pour ${resource}, ID: ${id}`);
       return { success: true, id };
     } catch (parseError) {
       console.warn(`Impossible de parser ID de la réponse pour ${resource}`);
@@ -259,5 +371,43 @@ export async function postXML(resource, xmlBody) {
     const errorMsg = `Erreur postXML(${resource}): ${error instanceof Error ? error.message : String(error)}`;
     console.error(errorMsg);
     return { success: false, error: errorMsg };
+  }
+}
+
+/**
+ * Envoie une image produit via l'API images de PrestaShop.
+ * @param {string|number} productId
+ * @param {File|Blob} file
+ * @returns {Promise<{success: boolean, id?: string, error?: string}>}
+ */
+export async function uploadProductImage(productId, file) {
+  try {
+    const formData = new FormData();
+    formData.append('image', file);
+
+    const response = await fetch(`${BASE_URL}/images/products/${productId}`, {
+      method: 'POST',
+      body: formData
+    });
+
+    const responseText = await response.text();
+    if (!response.ok) {
+      return {
+        success: false,
+        error: `HTTP ${response.status}: ${response.statusText}. Details: ${responseText.substring(0, 200)}`
+      };
+    }
+
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(responseText, 'text/xml');
+    const id = xmlDoc.querySelector('image > id')?.textContent?.trim()
+      || xmlDoc.querySelector('id')?.textContent?.trim();
+
+    return { success: true, id };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Erreur uploadProductImage(${productId}): ${error instanceof Error ? error.message : String(error)}`
+    };
   }
 }
