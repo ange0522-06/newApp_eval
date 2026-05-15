@@ -23,8 +23,8 @@ export function useReset(): UseResetReturn {
     isSuccess.value = false;
 
     try {
-      await resetAll();
-      message.value = 'Réinitialisation terminée avec succès';
+      const result = await resetAll();
+      message.value = result.message || 'Réinitialisation terminée avec succès';
       isSuccess.value = true;
     } catch (error) {
       message.value = `Une erreur est survenue: ${error instanceof Error ? error.message : String(error)}`;

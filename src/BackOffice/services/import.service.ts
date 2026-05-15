@@ -22,6 +22,7 @@ const ID_CURRENCY = 1;
 const FALLBACK_ACTIVE_COUNTRY_ID = '8';
 const DEFAULT_CUSTOMER_GROUP = 3;
 const DEFAULT_EMPLOYEE = 1;
+const INITIAL_ORDER_STATE = '1';
 
 type CreatedResponse = { success?: boolean; id?: string | number; error?: string };
 type ImagePayload = { name: string; mime: string; base64: string };
@@ -119,17 +120,39 @@ function readResourceNode(node: Element): Record<string, string> {
   return result;
 }
 
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Response> {
+  let lastResponse: Response | null = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const response = await fetch(`${API_CONFIG.BASE_URL}/${resource}?display=full`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'text/xml' },
+    });
+
+    if (response.ok || response.status < 500 || attempt === retries) {
+      return response;
+    }
+
+    lastResponse = response;
+    await wait(300 * (attempt + 1));
+  }
+
+  return lastResponse as Response;
+}
+
 async function loadFullResource(resource: string): Promise<Map<string, Record<string, string>>> {
   const cached = resourceFullCache.get(resource);
   if (cached) return cached;
 
-  const response = await fetch(`${API_CONFIG.BASE_URL}/${resource}?display=full`, {
-    method: 'GET',
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  const response = await fetchResourceWithRetry(resource);
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const errorText = await response.text().catch(() => '');
+    throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
   }
 
   const xmlText = await response.text();
@@ -1083,7 +1106,7 @@ export async function importCommandes(
       <payment><![CDATA[Cash on delivery]]></payment>
     <id_customer>${customer.id}</id_customer>
     <id_carrier>${carrierId}</id_carrier>
-    <current_state>${orderStateId}</current_state>
+    <current_state>${INITIAL_ORDER_STATE}</current_state>
     <secure_key>${xml(customer.secureKey)}</secure_key>
     <total_discounts>0.000000</total_discounts>
     <total_discounts_tax_incl>0.000000</total_discounts_tax_incl>
@@ -1102,7 +1125,7 @@ export async function importCommandes(
     <total_wrapping_tax_incl>0.000000</total_wrapping_tax_incl>
     <total_wrapping_tax_excl>0.000000</total_wrapping_tax_excl>
     <conversion_rate>1.000000</conversion_rate>
-    <valid>${orderStateId === '2' ? 1 : 0}</valid>
+    <valid>0</valid>
     <date_add>${date}</date_add>
     <date_upd>${date}</date_upd>
     <associations>
@@ -1114,6 +1137,11 @@ export async function importCommandes(
       `Commande ${email}`
     );
     transaction.trackResource('fichier3', 'orders', orderId);
+
+    if (orderStateId !== INITIAL_ORDER_STATE) {
+      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'current_state', orderStateId, false);
+      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'valid', orderStateId === '2' ? 1 : 0, false);
+    }
 
     const historyId = await postRequired(
       'order_histories',

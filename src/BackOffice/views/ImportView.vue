@@ -10,7 +10,7 @@
       <h2>Import transactionnel</h2>
       <p class="description">
         Selectionnez les 3 fichiers CSV et images.zip, puis lancez l'import. Si une etape echoue,
-        les ressources deja creees sont supprimees et les mises a jour sont restaurees.
+        les ressources deja creees sont supprimees, puis un reset complet nettoie les restes eventuels.
       </p>
 
       <div class="file-grid">
@@ -68,6 +68,7 @@ import {
   importCommandes,
 } from '../services/import.service';
 import { ImportTransaction } from '../services/transactionManager';
+import { resetAll } from '../services/reset.service';
 
 const file1 = ref<File | null>(null);
 const file2 = ref<File | null>(null);
@@ -186,6 +187,19 @@ function clearFiles(): void {
   if (zipInput.value) zipInput.value.value = '';
 }
 
+async function prepareImportEnvironment(): Promise<void> {
+  const response = await fetch('/newapp-api/prepare-import.php', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.success) {
+    throw new Error(data?.message || `Preparation import impossible: HTTP ${response.status}`);
+  }
+}
+
 async function importAll(): Promise<void> {
   if (!file1.value || !file2.value || !file3.value || !zipFile.value) {
     globalMessage.value = 'Les 4 fichiers sont requis.';
@@ -204,6 +218,7 @@ async function importAll(): Promise<void> {
 
   try {
     setStepStatus('validation', 'running', 'Lecture et controle des formats CSV/ZIP.');
+    await prepareImportEnvironment();
     const [csv1, csv2, csv3, images] = await Promise.all([
       parseTypedCsv(file1.value, 'produits'),
       parseTypedCsv(file2.value, 'declinaisons'),
@@ -249,17 +264,35 @@ async function importAll(): Promise<void> {
       ? failedStep
       : currentStep) as ImportStepKey;
 
+    const shouldRunReset = currentStep !== 'validation' || status.totalResourcesCreated > 0;
     setStepStatus(failedStepKey, 'failed', message);
     setStepStatus('rollback', 'running', 'Erreur detectee: annulation de tout ce qui a deja ete importe.');
     if (failedStep === currentStep && !status.steps.some((step) => step.name === failedStep)) {
       transaction.registerStep(failedStep);
     }
     await transaction.markStepFailed(failedStep, message);
+    let cleanupMessage = 'Rollback termine.';
+    let cleanupError = '';
+    if (shouldRunReset) {
+      setStepStatus('rollback', 'running', 'Rollback API termine. Reset complet des donnees importees en cours.');
+      try {
+        const resetResult = await resetAll();
+        cleanupMessage = `${cleanupMessage} ${resetResult.message}`;
+      } catch (resetError) {
+        cleanupError = resetError instanceof Error ? resetError.message : String(resetError);
+      }
+    }
     markImportedStepsRolledBack();
-    setStepStatus('rollback', 'success', 'Rollback termine: les 4 fichiers ne sont pas valides partiellement.');
+    if (cleanupError) {
+      setStepStatus('rollback', 'failed', `Rollback API tente, mais le reset complet a echoue: ${cleanupError}`);
+    } else {
+      setStepStatus('rollback', 'success', `${cleanupMessage} Les 4 fichiers ne sont pas valides partiellement.`);
+    }
     transaction.logReport();
     const failedLabel = importSteps.value.find((step) => step.key === failedStepKey)?.label || failedStepKey;
-    globalMessage.value = `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Aucun import partiel n'a ete conserve. Details: ${message}`;
+    globalMessage.value = cleanupError
+      ? `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Le nettoyage automatique a echoue, lancez le reset manuellement. Details: ${message}. Reset: ${cleanupError}`
+      : `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Aucun import partiel n'a ete conserve. Details: ${message}`;
     globalMessageStatus.value = 'error';
   } finally {
     isImportingAll.value = false;
