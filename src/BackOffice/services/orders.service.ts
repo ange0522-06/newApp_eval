@@ -23,8 +23,7 @@ export interface Order {
 
 const STATE_MAP: { [key: string]: string } = {
   '2': 'Paiement effectué',
-  '6': 'Annulé',
-  '8': 'Échec paiement',
+  '6': 'Annulé'
 };
 
 /**
@@ -114,16 +113,24 @@ export async function updateOrderState(
   <order>
     <id>${orderId}</id>
     <id_customer>${orderData.id_customer || ''}</id_customer>
+    <id_cart>${orderData.id_cart || ''}</id_cart>
     <id_address_delivery>${orderData.id_address_delivery || ''}</id_address_delivery>
     <id_address_invoice>${orderData.id_address_invoice || ''}</id_address_invoice>
     <id_shop>${orderData.id_shop || '1'}</id_shop>
     <id_order_state>${newStateId}</id_order_state>
     <current_state>${newStateId}</current_state>
     <id_currency>${orderData.id_currency || '1'}</id_currency>
-    <total_paid>${orderData.total_paid || '0'}</total_paid>
+    <id_lang>${orderData.id_lang || '1'}</id_lang>
+    <id_carrier>${orderData.id_carrier || ''}</id_carrier>
+    <id_module>${orderData.id_module || ''}</id_module>
+    <module><![CDATA[${orderData.module || orderData.payment || ''}]]></module>
+      <total_paid>${orderData.total_paid || '0'}</total_paid>
+      <conversion_rate>${orderData.conversion_rate || '1'}</conversion_rate>
+      <total_paid_real>${orderData.total_paid_real || orderData.total_paid || '0'}</total_paid_real>
     <total_paid_tax_excl>${orderData.total_paid_tax_excl || '0'}</total_paid_tax_excl>
     <total_products>${orderData.total_products || '0'}</total_products>
     <total_products_wt>${orderData.total_products_wt || '0'}</total_products_wt>
+    <valid>${newStateId === '2' ? '1' : '0'}</valid>
     <date_add>${orderData.date_add || ''}</date_add>
     <date_upd>${new Date().toISOString().replace('T', ' ').slice(0, 19)}</date_upd>
     <payment>${orderData.payment || '-'}</payment>
@@ -135,6 +142,29 @@ export async function updateOrderState(
     if (!updateSuccess) {
       console.error(`Erreur PUT order ${orderId}`);
       return false;
+    }
+
+    // Si la commande est marquée payée, créer aussi la trace de paiement
+    if (newStateId === '2') {
+      try {
+        const xmlOrderPayment = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <order_payment>
+    <order_reference>${orderData.reference || ''}</order_reference>
+    <id_currency>${orderData.id_currency || '1'}</id_currency>
+    <amount>${orderData.total_paid || '0'}</amount>
+    <payment><![CDATA[${orderData.payment || 'Manual'}]]></payment>
+    <date_add>${new Date().toISOString().replace('T', ' ').slice(0, 19)}</date_add>
+  </order_payment>
+</prestashop>`;
+
+        const paymentResult: any = await postXML('order_payments', xmlOrderPayment);
+        if (!paymentResult || !paymentResult.success) {
+          console.warn(`Avertissement: order_payment non créé pour commande ${orderId}`);
+        }
+      } catch (payErr) {
+        console.warn(`Erreur création order_payment pour ${orderId}:`, payErr);
+      }
     }
 
     // Créer un historique de changement d'état

@@ -59,14 +59,7 @@
             </td>
             <td class="cell-actions">
               <div class="action-buttons">
-                <button
-                  @click="changeOrderState(order, '8')"
-                  :disabled="order.current_state === '8' || isUpdating[order.id]"
-                  class="btn btn-state btn-error"
-                  title="Marquer comme échec de paiement"
-                >
-                  ❌ Échec
-                </button>
+                <!-- Échec supprimé — on gère seulement Payée et Annulé pour correspondre à PrestaShop simplifié -->
                 <button
                   @click="changeOrderState(order, '2')"
                   :disabled="order.current_state === '2' || isUpdating[order.id]"
@@ -138,14 +131,12 @@ function formatPrice(priceStr: string): string {
 /**
  * Retourne la classe CSS pour le badge selon l'état
  */
-function getStateBadgeClass(stateId: string): string {
+  function getStateBadgeClass(stateId: string): string {
   switch (stateId) {
     case '2':
       return 'success'; // Paiement effectué → vert
     case '6':
       return 'cancel'; // Annulé → gris
-    case '8':
-      return 'error'; // Échec paiement → rouge
     default:
       return 'info'; // Inconnu → bleu
   }
