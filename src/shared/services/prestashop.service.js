@@ -192,6 +192,13 @@ export async function putXML(resource, id, xmlBody) {
     if (!response.ok) {
       const errorText = await response.text();
       
+      // Log the XML we sent for easier debugging (similar to postXML)
+      try {
+        console.error(`📋 XML envoyé (PUT ${resource}/${id}):\n${xmlBody}`);
+      } catch (e) {
+        // ignore logging errors
+      }
+
       // Try to parse XML error response
       let parsedError = '';
       try {

@@ -6,6 +6,7 @@
 import {
   getAllIds,
   getOne,
+  getOneXml,
   putXML,
   postXML,
 } from '../../shared/services/prestashop.service.js';
@@ -18,6 +19,7 @@ export interface Order {
   id_customer: string;
   customerName: string;
   total_paid: string;
+  conversion_rate?: string;
   stateName: string;
 }
 
@@ -51,6 +53,7 @@ export async function getAllOrders(): Promise<Order[]> {
         const current_state = orderData.current_state || '8';
         const id_customer = orderData.id_customer || '';
         const total_paid = orderData.total_paid || '0';
+        const conversion_rate = orderData.conversion_rate || '1';
 
         // Récupérer les données du client
         let customerName = 'Inconnu';
@@ -74,6 +77,7 @@ export async function getAllOrders(): Promise<Order[]> {
           id_customer,
           customerName,
           total_paid,
+          conversion_rate,
           stateName: getStateName(current_state),
         });
       } catch (itemError) {
@@ -98,47 +102,60 @@ export async function updateOrderState(
   newStateId: string
 ): Promise<boolean> {
   try {
-    // Récupérer la commande actuelle
-    const orderData = (await getOne('orders', orderId)) as any;
-
     // Vérifier que le nouvel état est valide
     if (!STATE_MAP[newStateId]) {
       console.error(`État invalide: ${newStateId}`);
       return false;
     }
 
-    // Construire le XML modifié avec l'état mis à jour
-    const xmlOrder = `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <order>
-    <id>${orderId}</id>
-    <id_customer>${orderData.id_customer || ''}</id_customer>
-    <id_cart>${orderData.id_cart || ''}</id_cart>
-    <id_address_delivery>${orderData.id_address_delivery || ''}</id_address_delivery>
-    <id_address_invoice>${orderData.id_address_invoice || ''}</id_address_invoice>
-    <id_shop>${orderData.id_shop || '1'}</id_shop>
-    <id_order_state>${newStateId}</id_order_state>
-    <current_state>${newStateId}</current_state>
-    <id_currency>${orderData.id_currency || '1'}</id_currency>
-    <id_lang>${orderData.id_lang || '1'}</id_lang>
-    <id_carrier>${orderData.id_carrier || ''}</id_carrier>
-    <id_module>${orderData.id_module || ''}</id_module>
-    <module><![CDATA[${orderData.module || orderData.payment || ''}]]></module>
-      <total_paid>${orderData.total_paid || '0'}</total_paid>
-      <conversion_rate>${orderData.conversion_rate || '1'}</conversion_rate>
-      <total_paid_real>${orderData.total_paid_real || orderData.total_paid || '0'}</total_paid_real>
-    <total_paid_tax_excl>${orderData.total_paid_tax_excl || '0'}</total_paid_tax_excl>
-    <total_products>${orderData.total_products || '0'}</total_products>
-    <total_products_wt>${orderData.total_products_wt || '0'}</total_products_wt>
-    <valid>${newStateId === '2' ? '1' : '0'}</valid>
-    <date_add>${orderData.date_add || ''}</date_add>
-    <date_upd>${new Date().toISOString().replace('T', ' ').slice(0, 19)}</date_upd>
-    <payment>${orderData.payment || '-'}</payment>
-  </order>
-</prestashop>`;
+    // Récupérer la commande actuelle (XML complet si possible pour éviter d'écraser les montants)
+    const orderXmlText = await getOneXml('orders', orderId).catch(() => null);
+    let orderData: any = {};
+    let xmlOrderToPut = '';
+
+    if (orderXmlText) {
+      try {
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(orderXmlText, 'text/xml');
+        const orderElem = xmlDoc.querySelector('order') || xmlDoc.documentElement.firstElementChild;
+        if (!orderElem) throw new Error('order element not found in XML');
+
+        function setNode(tagName: string, value: string) {
+          let node = orderElem!.querySelector(tagName);
+          if (node) node.textContent = value;
+          else {
+            const newNode = xmlDoc.createElement(tagName);
+            newNode.textContent = value;
+            orderElem!.appendChild(newNode);
+          }
+        }
+
+        // Mettre à jour uniquement les champs d'état / valid / date_upd
+        setNode('id_order_state', newStateId);
+        setNode('current_state', newStateId);
+        setNode('valid', newStateId === '2' ? '1' : '0');
+        setNode('date_upd', new Date().toISOString().replace('T', ' ').slice(0, 19));
+
+        // Conserver les valeurs existantes pour orderData utilisées plus loin
+        Array.from(orderElem!.children).forEach((child: any) => {
+          orderData[child.tagName] = child.textContent || '';
+        });
+
+        const serializer = new XMLSerializer();
+        xmlOrderToPut = serializer.serializeToString(xmlDoc);
+      } catch (xmlErr) {
+        console.warn('Erreur parsing order XML, fallback to getOne()', xmlErr);
+      }
+    }
+
+    // Si on n'a pas pu obtenir le XML complet, récupérer les données parsées et construire un XML minimal
+    if (!xmlOrderToPut) {
+      orderData = (await getOne('orders', orderId)) as any;
+      xmlOrderToPut = `<?xml version="1.0" encoding="UTF-8"?>\n<prestashop>\n  <order>\n    <id>${orderId}</id>\n    <id_customer>${orderData.id_customer || ''}</id_customer>\n    <id_cart>${orderData.id_cart || ''}</id_cart>\n    <id_address_delivery>${orderData.id_address_delivery || ''}</id_address_delivery>\n    <id_address_invoice>${orderData.id_address_invoice || ''}</id_address_invoice>\n    <id_shop>${orderData.id_shop || '1'}</id_shop>\n    <id_order_state>${newStateId}</id_order_state>\n    <current_state>${newStateId}</current_state>\n    <id_currency>${orderData.id_currency || '1'}</id_currency>\n    <id_lang>${orderData.id_lang || '1'}</id_lang>\n    <id_carrier>${orderData.id_carrier || ''}</id_carrier>\n    <id_module>${orderData.id_module || ''}</id_module>\n    <module><![CDATA[${orderData.module || orderData.payment || ''}]]></module>\n    <total_paid>${orderData.total_paid || '0'}</total_paid>\n    <conversion_rate>${orderData.conversion_rate || '1'}</conversion_rate>\n    <total_paid_real>${orderData.total_paid_real || orderData.total_paid || '0'}</total_paid_real>\n    <total_paid_tax_excl>${orderData.total_paid_tax_excl || '0'}</total_paid_tax_excl>\n    <total_products>${orderData.total_products || '0'}</total_products>\n    <total_products_wt>${orderData.total_products_wt || '0'}</total_products_wt>\n    <valid>${newStateId === '2' ? '1' : '0'}</valid>\n    <date_add>${orderData.date_add || ''}</date_add>\n    <date_upd>${new Date().toISOString().replace('T', ' ').slice(0, 19)}</date_upd>\n    <payment>${orderData.payment || '-'}</payment>\n  </order>\n</prestashop>`;
+    }
 
     // Mettre à jour la commande
-    const updateSuccess = await putXML('orders', orderId, xmlOrder);
+    const updateSuccess = await putXML('orders', orderId, xmlOrderToPut);
     if (!updateSuccess) {
       console.error(`Erreur PUT order ${orderId}`);
       return false;

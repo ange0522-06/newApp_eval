@@ -1,11 +1,11 @@
 <template>
-  <div class="orders-view">
+  <div class="orders-view page-content container p-md">
     <div class="orders-header">
-      <h1>Gestion des commandes</h1>
+      <h1 class="text-primary font-bold">Gestion des commandes</h1>
       <button
         @click="loadOrders"
         :disabled="isLoading"
-        class="btn btn-refresh"
+        class="btn btn-primary"
       >
         {{ isLoading ? '⏳ Actualisation...' : '🔄 Actualiser' }}
       </button>
@@ -51,7 +51,7 @@
             <td class="cell-reference">{{ order.reference }}</td>
             <td class="cell-date">{{ formatDate(order.date_add) }}</td>
             <td class="cell-customer">{{ order.customerName }}</td>
-            <td class="cell-total">{{ formatPrice(order.total_paid) }}</td>
+            <td class="cell-total">{{ formatPrice(order.total_paid, order.conversion_rate) }}</td>
             <td class="cell-state">
               <span :class="['badge', `badge-${getStateBadgeClass(order.current_state)}`]">
                 {{ order.stateName }}
@@ -63,7 +63,7 @@
                 <button
                   @click="changeOrderState(order, '2')"
                   :disabled="order.current_state === '2' || isUpdating[order.id]"
-                  class="btn btn-state btn-success"
+                  class="btn btn-primary"
                   title="Marquer comme paiement effectué"
                 >
                   ✅ Payée
@@ -71,7 +71,7 @@
                 <button
                   @click="changeOrderState(order, '6')"
                   :disabled="order.current_state === '6' || isUpdating[order.id]"
-                  class="btn btn-state btn-cancel"
+                  class="btn btn-danger"
                   title="Marquer comme annulée"
                 >
                   🚫 Annuler
@@ -86,6 +86,7 @@
 </template>
 
 <script setup lang="ts">
+import '../../styles/styles.css';
 import { ref, onMounted } from 'vue';
 import { getAllOrders, updateOrderState, type Order } from '../services/orders.service';
 
@@ -118,11 +119,14 @@ function formatDate(dateStr: string): string {
 /**
  * Formate un prix avec symbole devise
  */
-function formatPrice(priceStr: string): string {
-  if (!priceStr) return '0 Ar';
+function formatPrice(priceStr: string, conversionRateStr?: string): string {
+  if (!priceStr) return '0 €';
   try {
-    const price = parseFloat(priceStr);
-    return `${price.toFixed(2)} Ar`;
+    const price = parseFloat(priceStr) || 0;
+    const conv = conversionRateStr ? parseFloat(conversionRateStr) || 1 : 1;
+    // Convert to EUR using conversion rate (price in shop currency / conversion_rate)
+    const euro = conv && conv !== 0 ? price / conv : price;
+    return `${euro.toFixed(2)} €`;
   } catch {
     return priceStr;
   }
