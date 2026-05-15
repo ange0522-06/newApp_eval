@@ -1,5 +1,14 @@
 import { createApp } from 'vue'
-// import App from './App.vue'
-import App from './Student.vue'
+import { createPinia } from 'pinia'
+import App from './App.vue'
+import router from './router/index.ts'
 
-createApp(App).mount('#app')
+// Importation du fichier CSS unique
+import './styles/styles.css'
+
+const app = createApp(App)
+
+app.use(createPinia())
+app.use(router)
+
+app.mount('#app')
