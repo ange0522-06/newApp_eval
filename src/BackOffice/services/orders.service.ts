@@ -17,6 +17,7 @@ export interface Order {
   date_add: string;
   current_state: string;
   id_customer: string;
+  id_cart: string;
   customerName: string;
   total_paid: string;
   conversion_rate?: string;
@@ -24,6 +25,7 @@ export interface Order {
 }
 
 const STATE_MAP: { [key: string]: string } = {
+  '13': 'Paiement a la livraison',
   '2': 'Paiement effectué',
   '6': 'Annulé'
 };
@@ -52,6 +54,7 @@ export async function getAllOrders(): Promise<Order[]> {
         const date_add = orderData.date_add || '';
         const current_state = orderData.current_state || '8';
         const id_customer = orderData.id_customer || '';
+        const id_cart = orderData.id_cart || '';
         const total_paid = orderData.total_paid || '0';
         const conversion_rate = orderData.conversion_rate || '1';
 
@@ -75,6 +78,7 @@ export async function getAllOrders(): Promise<Order[]> {
           date_add,
           current_state,
           id_customer,
+          id_cart,
           customerName,
           total_paid,
           conversion_rate,

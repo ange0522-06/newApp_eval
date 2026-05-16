@@ -2,12 +2,20 @@
   <div class="product-card">
 
     <!-- Image du produit -->
-    <img
-      :src="product.imageUrl"
-      :alt="product.name"
-      class="product-card__image"
-      @error="onImageError"
-    />
+    <div class="product-card__media">
+      <span
+        v-if="product.releaseBadge"
+        :class="['product-card__badge', `product-card__badge--${product.releaseBadge.toLowerCase()}`]"
+      >
+        {{ product.releaseBadge }}
+      </span>
+      <img
+        :src="product.imageUrl"
+        :alt="product.name"
+        class="product-card__image"
+        @error="onImageError"
+      />
+    </div>
 
     <!-- Informations du produit -->
     <div class="product-card__info">
@@ -98,12 +106,36 @@ function onImageError(event: Event): void {
   background: white;
 }
 
+.product-card__media {
+  position: relative;
+}
+
 .product-card__image {
   width: 100%;
   height: 180px;
   object-fit: cover;
   border-radius: 4px;
   background: #f5f5f5;
+}
+
+.product-card__badge {
+  border-radius: 999px;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  left: 0.5rem;
+  letter-spacing: 0;
+  padding: 0.25rem 0.55rem;
+  position: absolute;
+  top: 0.5rem;
+}
+
+.product-card__badge--hot {
+  background: #dc2626;
+}
+
+.product-card__badge--new {
+  background: #2563eb;
 }
 
 .product-card__info {

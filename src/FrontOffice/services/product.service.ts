@@ -20,6 +20,29 @@ function getMainImageId(doc: Document | Element): string {
   return doc.querySelector('associations images image id')?.textContent?.trim() ?? ''
 }
 
+function normalizeProductDate(value: string): string {
+  if (!value || value.startsWith('0000-00-00')) return ''
+  return value
+}
+
+function getProductReleaseDate(doc: Document | Element): string {
+  return normalizeProductDate(getText(doc, 'available_date')) ||
+    normalizeProductDate(getText(doc, 'date_add'))
+}
+
+function getReleaseBadge(dateValue: string): 'HOT' | 'NEW' | undefined {
+  if (!dateValue) return undefined
+
+  const releaseDate = new Date(dateValue.replace(' ', 'T'))
+  if (Number.isNaN(releaseDate.getTime())) return undefined
+
+  const ageInDays = (Date.now() - releaseDate.getTime()) / (1000 * 60 * 60 * 24)
+  if (ageInDays < 0) return undefined
+  if (ageInDays <= 1) return 'HOT'
+  if (ageInDays <= 7) return 'NEW'
+  return undefined
+}
+
 // ─── Image ───────────────────────────────────────────────────────────────────
 
 export function getProductImageUrl(productId: string, imageId: string): string {
@@ -161,6 +184,7 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
     const imageId = getMainImageId(doc)
     const name = getLangText(doc, 'name')
     const idCategoryDefault = getText(doc, 'id_category_default')
+    const availableDate = getProductReleaseDate(doc)
 
     // Récupérer TOUTES les catégories du produit (pas juste la catégorie par défaut)
     const categoryElements = doc.querySelectorAll('associations categories category')
@@ -178,6 +202,8 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
       imageUrl:            getProductImageUrl(id, imageId),
       id_category_default: idCategoryDefault,
       category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
+      availableDate,
+      releaseBadge:        getReleaseBadge(availableDate),
       active:              getText(doc, 'active') === '1'
     }
   } catch {
@@ -239,6 +265,7 @@ export async function getProductById(id: string): Promise<ProductDetail> {
     const idTaxRulesGroup = getText(doc, 'id_tax_rules_group')
     const taxRate = await getTaxRate(idTaxRulesGroup)
     const imageId = getMainImageId(doc)
+    const availableDate = getProductReleaseDate(doc)
 
     // Récupérer les IDs des combinaisons
     const combinationElements = doc.querySelectorAll('associations combinations combination')
@@ -286,7 +313,10 @@ export async function getProductById(id: string): Promise<ProductDetail> {
       imageUrl:            getProductImageUrl(id, imageId),
       id_category_default: idCategoryDefault,
       category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
+      availableDate,
+      releaseBadge:        getReleaseBadge(availableDate),
       active:              getText(doc, 'active') === '1',
+      stock:               getStockFromCache(id, '0'),
       combinations,
       hasCombinations:     combinations.length > 0
     }
@@ -301,6 +331,52 @@ export async function getProductById(id: string): Promise<ProductDetail> {
 /**
  * Récupère toutes les catégories (hors racine et accueil)
  */
+type DatabaseCategoryResponse = {
+  success?: boolean
+  categories?: Array<{
+    id: string | number
+    name: string
+    parent_id?: string | number | null
+  }>
+}
+
+async function getDatabaseCategories(): Promise<Category[]> {
+  try {
+    const response = await fetch('/newapp-api/categories-lang.php?id_lang=1')
+    if (!response.ok) return []
+
+    const payload = await response.json() as DatabaseCategoryResponse
+    if (!payload.success || !Array.isArray(payload.categories)) return []
+
+    return payload.categories
+      .map(category => ({
+        id: String(category.id),
+        name: category.name || `CatÃ©gorie ${category.id}`,
+        parent_id: category.parent_id !== null && category.parent_id !== undefined
+          ? String(category.parent_id)
+          : undefined,
+      }))
+      .filter(category => category.id !== '1' && category.id !== '2')
+  } catch {
+    return []
+  }
+}
+
+function labelDuplicateCategoryNames(categories: Category[]): Category[] {
+  const nameCounts = categories.reduce((counts, category) => {
+    counts.set(category.name, (counts.get(category.name) || 0) + 1)
+    return counts
+  }, new Map<string, number>())
+
+  return categories.map(category => {
+    if ((nameCounts.get(category.name) || 0) <= 1) return category
+    return {
+      ...category,
+      name: `${category.name} #${category.id}`,
+    }
+  })
+}
+
 export async function getAllCategories(): Promise<Category[]> {
   try {
     const ids = await getAllIds('categories')
@@ -327,11 +403,18 @@ export async function getAllCategories(): Promise<Category[]> {
       }
     }
 
-    // Trier par nom
-    categories.sort((a, b) => a.name.localeCompare(b.name))
-    return categories
+    const merged = new Map<string, Category>()
+    for (const category of await getDatabaseCategories()) {
+      merged.set(category.id, category)
+    }
+    for (const category of categories) {
+      merged.set(category.id, category)
+    }
+
+    return labelDuplicateCategoryNames(Array.from(merged.values()))
+      .sort((a, b) => a.name.localeCompare(b.name))
   } catch (error) {
     console.error('Erreur getAllCategories:', error)
-    return []
+    return getDatabaseCategories()
   }
 }

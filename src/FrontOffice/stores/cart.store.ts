@@ -1,89 +1,290 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { getAllIds, getOne, postXML } from '@/shared/services/prestashop.service.js'
 
 const ID_SHOP = 1
+const ID_SHOP_GROUP = 1
 const ID_CURRENCY = 1
 const ID_LANG = 1
+const DEFAULT_EMPLOYEE = 1
+const CASH_ON_DELIVERY_STATE = '13'
+const CASH_ON_DELIVERY_MODULE = 'ps_cashondelivery'
+const CASH_ON_DELIVERY_LABEL = 'Paiement a la livraison'
+const FALLBACK_COUNTRY_ID = '8'
 
 export interface CartItem {
   productId: string
   combinationId?: string
   name: string
+  reference?: string
   imageUrl?: string
-  price: number // HT or TTC depending on how product.priceTTC is used
+  price?: number
+  priceHT?: number
+  priceTTC?: number
+  taxRate?: number
+  stock?: number
   quantity: number
+}
+
+type CreatedResponse = { success?: boolean; id?: string | number; error?: string }
+
+function xml(value: string | number): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+}
+
+function cdata(value: string | number): string {
+  return `<![CDATA[${String(value).replace(/\]\]>/g, ']]]]><![CDATA[>')}]]>`
+}
+
+function normalize(value: string): string {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim()
+}
+
+function nowForPrestaShop(): string {
+  return new Date().toISOString().replace('T', ' ').slice(0, 19)
+}
+
+function getItemPriceTTC(item: CartItem): number {
+  return Number(item.priceTTC ?? item.price ?? 0)
+}
+
+function getItemPriceHT(item: CartItem): number {
+  if (item.priceHT !== undefined) return Number(item.priceHT) || 0
+  const taxRate = Number(item.taxRate ?? 0)
+  const priceTTC = getItemPriceTTC(item)
+  return taxRate > 0 ? priceTTC / (1 + taxRate) : priceTTC
+}
+
+function getCreatedId(result: CreatedResponse, label: string): string {
+  if (result && result.success && result.id) return String(result.id)
+  throw new Error(result?.error || `${label}_creation_failed`)
 }
 
 export const useCartStore = defineStore('cart', () => {
   const items = ref<CartItem[]>([])
+  const stockError = ref('')
 
-  // Persist in localStorage
-  function loadFromStorage() {
-    const raw = localStorage.getItem('cart_items')
-    if (raw) {
-      try { items.value = JSON.parse(raw) } catch { items.value = [] }
-    }
+  const totalHT = computed(() =>
+    items.value.reduce((sum, item) => sum + getItemPriceHT(item) * item.quantity, 0)
+  )
+  const totalTTC = computed(() =>
+    items.value.reduce((sum, item) => sum + getItemPriceTTC(item) * item.quantity, 0)
+  )
+  const totalQuantity = computed(() =>
+    items.value.reduce((sum, item) => sum + item.quantity, 0)
+  )
+
+  function clearLegacyStoredCart() {
+    localStorage.removeItem('cart_items')
   }
-  function saveToStorage() {
-    localStorage.setItem('cart_items', JSON.stringify(items.value))
+
+  function getStockLimit(item: CartItem): number {
+    return Number.isFinite(item.stock) ? Math.max(0, Number(item.stock)) : Number.POSITIVE_INFINITY
+  }
+
+  function findItem(productId: string, combinationId?: string): CartItem | undefined {
+    return items.value.find(i =>
+      i.productId === productId &&
+      (i.combinationId || '') === (combinationId || '')
+    )
+  }
+
+  function setStockError(message: string) {
+    stockError.value = message
+  }
+
+  function clearStockError() {
+    stockError.value = ''
   }
 
   function addItem(item: CartItem) {
-    const existing = items.value.find(i => i.productId === item.productId && (i.combinationId || '') === (item.combinationId || ''))
-    if (existing) {
-      existing.quantity += item.quantity
-    } else {
-      items.value.push(item)
+    clearStockError()
+    const existing = findItem(item.productId, item.combinationId)
+    const stockLimit = getStockLimit(item)
+    const requestedQuantity = Math.max(1, Math.floor(item.quantity || 1))
+    const nextQuantity = (existing?.quantity || 0) + requestedQuantity
+
+    if (nextQuantity > stockLimit) {
+      const remainingStock = Math.max(0, stockLimit - (existing?.quantity || 0))
+      setStockError(`Stock insuffisant pour ${item.name}. Stock restant: ${remainingStock}.`)
+      return { success: false, error: stockError.value }
     }
-    saveToStorage()
+
+    if (existing) {
+      existing.quantity = nextQuantity
+      existing.stock = item.stock
+    } else {
+      items.value.push({
+        ...item,
+        priceHT: item.priceHT ?? getItemPriceHT(item),
+        priceTTC: item.priceTTC ?? getItemPriceTTC(item),
+        quantity: requestedQuantity,
+      })
+    }
+
+    return { success: true }
   }
 
   function removeItem(productId: string, combinationId?: string) {
-    const key = (combinationId || '')
-    items.value = items.value.filter(i => !(i.productId === productId && (i.combinationId || '') === key))
-    saveToStorage()
+    clearStockError()
+    const key = combinationId || ''
+    items.value = items.value.filter(i =>
+      !(i.productId === productId && (i.combinationId || '') === key)
+    )
   }
 
   function updateQuantity(productId: string, combinationId: string | undefined, qty: number) {
-    const it = items.value.find(i => i.productId === productId && (i.combinationId || '') === (combinationId || ''))
-    if (it) {
-      it.quantity = Math.max(1, qty)
-      saveToStorage()
+    clearStockError()
+    const item = findItem(productId, combinationId)
+
+    if (item) {
+      const requestedQuantity = Math.max(1, Math.floor(qty || 1))
+      const stockLimit = getStockLimit(item)
+
+      if (requestedQuantity > stockLimit) {
+        setStockError(`Stock insuffisant pour ${item.name}. Stock restant: ${stockLimit}.`)
+        return { success: false, error: stockError.value }
+      }
+
+      item.quantity = requestedQuantity
+      return { success: true }
     }
+
+    return { success: false, error: 'Produit introuvable dans le panier.' }
   }
 
   function clear() {
+    clearStockError()
     items.value = []
-    saveToStorage()
   }
 
-  loadFromStorage()
+  clearLegacyStoredCart()
 
-  /**
-   * Trouve l'ID client PrestaShop à partir de l'email
-   */
   async function findCustomerIdByEmail(email: string): Promise<string | null> {
     const ids = await getAllIds('customers')
+    const wantedEmail = normalize(email)
+
     for (const id of ids) {
       try {
         const data = (await getOne('customers', id)) as any
-        if (data.email === email) return id
+        if (normalize(data.email || '') === wantedEmail) return id
       } catch {
         continue
       }
     }
+
     return null
   }
 
-  /**
-   * Place une commande réelle via l'API PrestaShop
-   * Retourne l'objet { success, orderId?, error? }
-   */
+  async function getDefaultCountryId(): Promise<string> {
+    const forced = localStorage.getItem('forced_id_country')
+    if (forced) return forced
+
+    try {
+      const ids = await getAllIds('countries')
+      const countries = await Promise.allSettled(
+        ids.map(async id => ({ id, data: (await getOne('countries', id)) as any }))
+      )
+      const activeCountries = countries
+        .filter((result): result is PromiseFulfilledResult<{ id: string, data: any }> =>
+          result.status === 'fulfilled'
+        )
+        .filter(result => result.value.data?.active === '1')
+        .map(result => result.value)
+
+      const preferred =
+        activeCountries.find(country => country.data.iso_code === 'MG') ||
+        activeCountries.find(country => country.data.iso_code === 'FR') ||
+        activeCountries[0]
+
+      return preferred?.id || FALLBACK_COUNTRY_ID
+    } catch {
+      return FALLBACK_COUNTRY_ID
+    }
+  }
+
+  async function getDefaultCarrierId(): Promise<string> {
+    const forced = localStorage.getItem('forced_id_carrier')
+    if (forced) return forced
+
+    const ids = await getAllIds('carriers')
+    for (const id of ids) {
+      try {
+        const carrier = (await getOne('carriers', id)) as any
+        if (carrier.active === '1' && carrier.deleted !== '1') return id
+      } catch {
+        continue
+      }
+    }
+
+    return ids[0] || '1'
+  }
+
+  async function postRequired(resource: string, body: string, label: string): Promise<string> {
+    const result = (await postXML(resource, body)) as CreatedResponse
+    return getCreatedId(result, label)
+  }
+
+  async function createAnonymousCustomer(
+    address: { firstname: string, lastname: string }
+  ): Promise<string> {
+    const createdAt = nowForPrestaShop()
+    const email = localStorage.getItem('auth_email') || `anonymous-${Date.now()}@newapp.local`
+    const firstname = address.firstname || 'Utilisateur'
+    const lastname = address.lastname || 'Anonyme'
+    const xmlCustomer = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <customer>
+    <id_default_group>3</id_default_group>
+    <id_lang>${ID_LANG}</id_lang>
+    <passwd>${cdata(`anonymous-${Date.now()}`)}</passwd>
+    <lastname>${cdata(lastname)}</lastname>
+    <firstname>${cdata(firstname)}</firstname>
+    <email>${cdata(email)}</email>
+    <active>1</active>
+    <is_guest>1</is_guest>
+    <id_shop>${ID_SHOP}</id_shop>
+    <id_shop_group>${ID_SHOP_GROUP}</id_shop_group>
+    <date_add>${createdAt}</date_add>
+    <date_upd>${createdAt}</date_upd>
+    <associations>
+      <groups>
+        <group><id>3</id></group>
+      </groups>
+    </associations>
+  </customer>
+</prestashop>`
+
+    const customerId = await postRequired('customers', xmlCustomer, 'anonymous_customer')
+    localStorage.setItem('auth_customer_id', customerId)
+    return customerId
+  }
+
+  function validateCartStock(): { success: boolean, error?: string } {
+    clearStockError()
+    for (const item of items.value) {
+      const stockLimit = getStockLimit(item)
+      if (item.quantity > stockLimit) {
+        setStockError(`Stock insuffisant pour ${item.name}. Stock restant: ${stockLimit}.`)
+        return { success: false, error: stockError.value }
+      }
+    }
+    return { success: true }
+  }
+
   async function placeOrder(
     address: { firstname: string, lastname: string, address1: string, city: string, postcode: string, phone?: string },
-    options?: { forceModuleId?: string | number, forceCarrierId?: string | number }
+    options?: { forceCarrierId?: string | number }
   ) {
+    if (items.value.length === 0) return { success: false, error: 'empty_cart' }
+    const stockCheck = validateCartStock()
+    if (!stockCheck.success) return stockCheck
+
     const isCustomerAuthenticated =
       localStorage.getItem('auth_authenticated') === 'true' &&
       localStorage.getItem('auth_email') !== null &&
@@ -93,108 +294,196 @@ export const useCartStore = defineStore('cart', () => {
     const email = localStorage.getItem('auth_email')
     if (!email) return { success: false, error: 'missing_email' }
 
-    // 1) retrouver l'id client par email
-    const idCustomer = await findCustomerIdByEmail(email)
+    let idCustomer = await findCustomerIdByEmail(email)
+    if (!idCustomer && localStorage.getItem('auth_is_anonymous') === 'true') {
+      try {
+        idCustomer = await createAnonymousCustomer(address)
+      } catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : 'anonymous_customer_creation_failed' }
+      }
+    }
     if (!idCustomer) return { success: false, error: 'customer_not_found' }
 
-    // 2) créer l'adresse
-    const xmlAddress = `<?xml version="1.0" encoding="UTF-8"?>\n<prestashop>\n  <address>\n    <id_customer>${idCustomer}</id_customer>\n    <id_country>18</id_country>\n    <firstname><![CDATA[${address.firstname}]]></firstname>\n    <lastname><![CDATA[${address.lastname}]]></lastname>\n    <address1><![CDATA[${address.address1}]]></address1>\n    <city><![CDATA[${address.city}]]></city>\n    <postcode><![CDATA[${address.postcode}]]></postcode>\n    <phone><![CDATA[${address.phone || ''}]]></phone>\n    <active>1</active>\n  </address>\n</prestashop>`
-
-    const resultAddr: any = await postXML('addresses', xmlAddress)
-    let idAddress = ''
-    if (resultAddr && ((resultAddr.success && resultAddr.id) || typeof resultAddr === 'string' || typeof resultAddr === 'number')) {
-      idAddress = resultAddr.id ? resultAddr.id : String(resultAddr)
-    } else {
-      return { success: false, error: 'address_creation_failed' }
-    }
-
-    // 3) créer le panier avec les lignes (cart_rows)
-    // Allow forcing carrier/module via options or localStorage (admin can set)
-    const forcedCarrierLS = localStorage.getItem('forced_id_carrier')
-    const forcedModuleLS = localStorage.getItem('forced_id_module')
-
-    // Try to find a carrier to include in the cart
-    let idCarrier: number | string = 0
-    if (options && options.forceCarrierId) idCarrier = options.forceCarrierId
-    else if (forcedCarrierLS) idCarrier = forcedCarrierLS
+    let secureKey = ''
     try {
-      const carrierIds = await getAllIds('carriers')
-      for (const cid of carrierIds) {
-        try {
-          const c: any = await getOne('carriers', cid)
-          if (c && (c.active === '1' || c.active === 1)) { idCarrier = cid; break }
-        } catch {}
-      }
-      if (!idCarrier && carrierIds.length) idCarrier = carrierIds[0]
-    } catch (e) {
-      idCarrier = 0
+      const customer = (await getOne('customers', idCustomer)) as any
+      secureKey = customer?.secure_key || ''
+    } catch {}
+
+    const createdAt = nowForPrestaShop()
+    const idCountry = await getDefaultCountryId()
+    const xmlAddress = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <address>
+    <id_customer>${idCustomer}</id_customer>
+    <id_country>${xml(idCountry)}</id_country>
+    <alias>${cdata('Adresse commande')}</alias>
+    <firstname>${cdata(address.firstname)}</firstname>
+    <lastname>${cdata(address.lastname)}</lastname>
+    <address1>${cdata(address.address1)}</address1>
+    <city>${cdata(address.city)}</city>
+    <postcode>${cdata(address.postcode)}</postcode>
+    <phone>${cdata(address.phone || '')}</phone>
+    <deleted>0</deleted>
+    <active>1</active>
+    <date_add>${createdAt}</date_add>
+    <date_upd>${createdAt}</date_upd>
+  </address>
+</prestashop>`
+
+    let idAddress = ''
+    try {
+      idAddress = await postRequired('addresses', xmlAddress, 'address')
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'address_creation_failed' }
     }
 
-    const cartRowsXml = items.value.map(it => {
-      const idProductAttr = it.combinationId || 0
-      return `<cart_row>\n        <id_product>${it.productId}</id_product>\n        <id_product_attribute>${idProductAttr}</id_product_attribute>\n        <quantity>${it.quantity}</quantity>\n      </cart_row>`
-    }).join('\n')
+    let idCarrier: string | number = options?.forceCarrierId || ''
+    if (!idCarrier) idCarrier = await getDefaultCarrierId()
 
-    const xmlCart = `<?xml version="1.0" encoding="UTF-8"?>\n<prestashop>\n  <cart>\n    <id_customer>${idCustomer}</id_customer>\n    <id_address_delivery>${idAddress}</id_address_delivery>\n    <id_address_invoice>${idAddress}</id_address_invoice>\n    <id_shop>${ID_SHOP}</id_shop>\n    <id_currency>${ID_CURRENCY}</id_currency>\n    <id_lang>${ID_LANG}</id_lang>\n    <id_carrier>${idCarrier}</id_carrier>\n    <associations>\n      <cart_rows>\n${cartRowsXml}\n      </cart_rows>\n    </associations>\n  </cart>\n</prestashop>`
+    const cartRowsXml = items.value.map(item => {
+      const idProductAttribute = item.combinationId || 0
+      return `
+      <cart_row>
+        <id_product>${item.productId}</id_product>
+        <id_product_attribute>${idProductAttribute}</id_product_attribute>
+        <id_address_delivery>${idAddress}</id_address_delivery>
+        <id_customization>0</id_customization>
+        <quantity>${item.quantity}</quantity>
+      </cart_row>`
+    }).join('')
 
-    const resultCart: any = await postXML('carts', xmlCart)
+    const xmlCart = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <cart>
+    <id_address_delivery>${idAddress}</id_address_delivery>
+    <id_address_invoice>${idAddress}</id_address_invoice>
+    <id_currency>${ID_CURRENCY}</id_currency>
+    <id_customer>${idCustomer}</id_customer>
+    <id_guest>0</id_guest>
+    <id_lang>${ID_LANG}</id_lang>
+    <id_shop_group>${ID_SHOP_GROUP}</id_shop_group>
+    <id_shop>${ID_SHOP}</id_shop>
+    <id_carrier>${idCarrier}</id_carrier>
+    <recyclable>0</recyclable>
+    <gift>0</gift>
+    <mobile_theme>0</mobile_theme>
+    <delivery_option></delivery_option>
+    <secure_key>${xml(secureKey)}</secure_key>
+    <allow_seperated_package>0</allow_seperated_package>
+    <date_add>${createdAt}</date_add>
+    <date_upd>${createdAt}</date_upd>
+    <associations>
+      <cart_rows>${cartRowsXml}
+      </cart_rows>
+    </associations>
+  </cart>
+</prestashop>`
+
     let idCart = ''
-    if (resultCart && ((resultCart.success && resultCart.id) || typeof resultCart === 'string' || typeof resultCart === 'number')) {
-      idCart = resultCart.id ? resultCart.id : String(resultCart)
-    } else {
-      return { success: false, error: 'cart_creation_failed' }
+    try {
+      idCart = await postRequired('carts', xmlCart, 'cart')
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'cart_creation_failed' }
     }
 
-    // 4) calculer totaux
-    const totalProducts = items.value.reduce((s, it) => s + it.price * it.quantity, 0)
-    const totalProductsWT = totalProducts
+    const totalProducts = totalHT.value
+    const totalProductsWT = totalTTC.value
     const totalShipping = 0
     const totalPaid = totalProductsWT + totalShipping
 
-    // 5) prepare additional info required for a valid order
-    // get customer secure_key
-    let secureKey = ''
+    const orderRowsXml = items.value.map(item => {
+      const idProductAttribute = item.combinationId || 0
+      const unitHT = getItemPriceHT(item)
+      const unitTTC = getItemPriceTTC(item)
+      return `
+      <order_row>
+        <product_id>${item.productId}</product_id>
+        <product_attribute_id>${idProductAttribute}</product_attribute_id>
+        <product_quantity>${item.quantity}</product_quantity>
+        <product_name>${cdata(item.name)}</product_name>
+        <product_reference>${cdata(item.reference || '')}</product_reference>
+        <product_price>${unitHT.toFixed(6)}</product_price>
+        <unit_price_tax_incl>${unitTTC.toFixed(6)}</unit_price_tax_incl>
+        <unit_price_tax_excl>${unitHT.toFixed(6)}</unit_price_tax_excl>
+      </order_row>`
+    }).join('')
+
+    const xmlOrder = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <order>
+    <id_address_delivery>${idAddress}</id_address_delivery>
+    <id_address_invoice>${idAddress}</id_address_invoice>
+    <id_cart>${idCart}</id_cart>
+    <id_currency>${ID_CURRENCY}</id_currency>
+    <id_lang>${ID_LANG}</id_lang>
+    <id_shop>${ID_SHOP}</id_shop>
+    <id_shop_group>${ID_SHOP_GROUP}</id_shop_group>
+    <module>${CASH_ON_DELIVERY_MODULE}</module>
+    <payment>${cdata(CASH_ON_DELIVERY_LABEL)}</payment>
+    <id_customer>${idCustomer}</id_customer>
+    <id_carrier>${idCarrier}</id_carrier>
+    <current_state>${CASH_ON_DELIVERY_STATE}</current_state>
+    <secure_key>${xml(secureKey)}</secure_key>
+    <total_discounts>0.000000</total_discounts>
+    <total_discounts_tax_incl>0.000000</total_discounts_tax_incl>
+    <total_discounts_tax_excl>0.000000</total_discounts_tax_excl>
+    <total_paid>${totalPaid.toFixed(6)}</total_paid>
+    <total_paid_tax_incl>${totalPaid.toFixed(6)}</total_paid_tax_incl>
+    <total_paid_tax_excl>${totalProducts.toFixed(6)}</total_paid_tax_excl>
+    <total_paid_real>${totalPaid.toFixed(6)}</total_paid_real>
+    <total_products>${totalProducts.toFixed(6)}</total_products>
+    <total_products_wt>${totalProductsWT.toFixed(6)}</total_products_wt>
+    <total_shipping>${totalShipping.toFixed(6)}</total_shipping>
+    <total_shipping_tax_incl>${totalShipping.toFixed(6)}</total_shipping_tax_incl>
+    <total_shipping_tax_excl>${totalShipping.toFixed(6)}</total_shipping_tax_excl>
+    <carrier_tax_rate>0.000000</carrier_tax_rate>
+    <total_wrapping>0.000000</total_wrapping>
+    <total_wrapping_tax_incl>0.000000</total_wrapping_tax_incl>
+    <total_wrapping_tax_excl>0.000000</total_wrapping_tax_excl>
+    <conversion_rate>1.000000</conversion_rate>
+    <valid>0</valid>
+    <date_add>${createdAt}</date_add>
+    <date_upd>${createdAt}</date_upd>
+    <associations>
+      <order_rows>${orderRowsXml}
+      </order_rows>
+    </associations>
+  </order>
+</prestashop>`
+
     try {
-      const cust: any = await getOne('customers', idCustomer)
-      secureKey = cust && cust.secure_key ? cust.secure_key : ''
-    } catch {}
+      const idOrder = await postRequired('orders', xmlOrder, 'order')
 
-    // try to find a payment module (prefer cash on delivery)
-    let idModule: number | string = 0
-    if (options && options.forceModuleId) idModule = options.forceModuleId
-    else if (forcedModuleLS) idModule = forcedModuleLS
-    let paymentName = 'Paiement à la livraison'
-    try {
-      const moduleIds = await getAllIds('modules')
-      for (const mid of moduleIds) {
-        try {
-          const m: any = await getOne('modules', mid)
-          const name = (m.name || m.module_name || m.displayName || '').toString().toLowerCase()
-          if (name.includes('cash') || name.includes('cashondelivery') || name.includes('paiement')) {
-            idModule = mid
-            paymentName = m.displayName || paymentName
-            break
-          }
-        } catch {}
-      }
-      if (!idModule && moduleIds.length) idModule = moduleIds[0]
-    } catch (e) { idModule = 0 }
+      const xmlOrderHistory = `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <order_history>
+    <id_employee>${DEFAULT_EMPLOYEE}</id_employee>
+    <id_order_state>${CASH_ON_DELIVERY_STATE}</id_order_state>
+    <id_order>${idOrder}</id_order>
+    <date_add>${createdAt}</date_add>
+  </order_history>
+</prestashop>`
 
-    // 6) créer la commande (webservice-only) — inclut id_module, id_carrier, secure_key
-    const now = new Date().toISOString().replace('T', ' ').slice(0, 19)
-    const xmlOrder = `<?xml version="1.0" encoding="UTF-8"?>\n<prestashop>\n  <order>\n    <id_customer>${idCustomer}</id_customer>\n    <id_cart>${idCart}</id_cart>\n    <id_address_delivery>${idAddress}</id_address_delivery>\n    <id_address_invoice>${idAddress}</id_address_invoice>\n    <id_shop>${ID_SHOP}</id_shop>\n    <id_currency>${ID_CURRENCY}</id_currency>\n    <id_lang>${ID_LANG}</id_lang>\n    <id_carrier>${idCarrier}</id_carrier>\n    <id_module>${idModule}</id_module>\n    <secure_key><![CDATA[${secureKey}]]></secure_key>\n    <current_state>2</current_state>\n    <total_paid>${totalPaid.toFixed(2)}</total_paid>\n    <total_paid_tax_incl>${totalPaid.toFixed(2)}</total_paid_tax_incl>\n    <total_paid_tax_excl>${totalProducts.toFixed(2)}</total_paid_tax_excl>\n    <total_products>${totalProducts.toFixed(2)}</total_products>\n    <total_products_wt>${totalProductsWT.toFixed(2)}</total_products_wt>\n    <total_shipping>${totalShipping.toFixed(2)}</total_shipping>\n    <conversion_rate>1</conversion_rate>\n    <date_add>${now}</date_add>\n    <payment><![CDATA[${paymentName}]]></payment>\n  </order>\n</prestashop>`
-
-    const resultOrder: any = await postXML('orders', xmlOrder)
-    let idOrder = ''
-    if (resultOrder && ((resultOrder.success && resultOrder.id) || typeof resultOrder === 'string' || typeof resultOrder === 'number')) {
-      idOrder = resultOrder.id ? resultOrder.id : String(resultOrder)
-      // vider le panier local
+      await postXML('order_histories', xmlOrderHistory)
       clear()
       return { success: true, orderId: idOrder }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'order_creation_failed' }
     }
-
-    return { success: false, error: 'order_creation_failed' }
   }
 
-  return { items, addItem, removeItem, updateQuantity, clear, placeOrder }
+  return {
+    items,
+    stockError,
+    totalHT,
+    totalTTC,
+    totalQuantity,
+    validateCartStock,
+    addItem,
+    removeItem,
+    updateQuantity,
+    clear,
+    placeOrder,
+  }
 })

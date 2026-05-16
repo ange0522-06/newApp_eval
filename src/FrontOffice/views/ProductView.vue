@@ -73,13 +73,16 @@
         <p class="product-detail__stock">
           Stock disponible : {{ currentStock }}
         </p>
+        <p v-if="cartError" class="product-detail__error">
+          {{ cartError }}
+        </p>
 
         <!-- Quantité -->
         <div class="product-detail__quantity">
           <label>Quantité :</label>
           <input
             type="number"
-            v-model="quantity"
+            v-model.number="quantity"
             :min="1"
             :max="currentStock"
             class="input-quantity"
@@ -90,7 +93,7 @@
         <div class="product-actions">
           <button
             class="btn-cart"
-            :disabled="currentStock === 0"
+            :disabled="currentStock === 0 || quantity > currentStock"
             @click="addToCart"
           >
             {{ currentStock === 0 ? 'Rupture de stock' : 'Ajouter au panier' }}
@@ -99,7 +102,7 @@
           <!-- Bouton continuer l'achat (ajoute et retourne à l'accueil) -->
           <button
             class="btn-continue"
-            :disabled="currentStock === 0"
+            :disabled="currentStock === 0 || quantity > currentStock"
             @click="continueShopping"
           >
             Continuer l'achat
@@ -166,6 +169,7 @@ const selectedAttributeIds = ref<string[]>([])
  * Sert à afficher le message de confirmation
  */
 const addedToCart = ref<boolean>(false)
+const cartError = ref('')
 
 // ─── Computed ─────────────────────────────────────────────────────────────────
 
@@ -202,7 +206,8 @@ const selectedPrice = computed<number>(() => {
  * Sinon → 0 (forcer la sélection d'une déclinaison)
  */
 const currentStock = computed<number>(() => {
-  if (!product.value?.hasCombinations) return 0
+  if (!product.value) return 0
+  if (!product.value.hasCombinations) return product.value.stock
   if (selectedCombination.value) {
     return selectedCombination.value.stock
   }
@@ -284,22 +289,48 @@ function selectAttribute(groupName: string, attributeId: string): void {
  * Pour l'instant : log dans la console
  * À remplacer par cartStore.addItem() quand le store panier sera créé
  */
+function buildCartItem() {
+  if (!product.value) return
+  if (quantity.value < 1) {
+    cartError.value = 'La quantite doit etre au moins egale a 1.'
+    return
+  }
+  if (quantity.value > currentStock.value) {
+    cartError.value = `Stock insuffisant. Stock restant: ${currentStock.value}.`
+    return
+  }
+
+  const priceTTC = selectedCombination.value ? selectedCombination.value.price : product.value.priceTTC
+  const priceHT = product.value.taxRate > 0 ? priceTTC / (1 + product.value.taxRate) : product.value.price
+
+  return {
+    productId: product.value.id,
+    combinationId: selectedCombination.value?.id,
+    name: product.value.name,
+    reference: product.value.reference,
+    imageUrl: product.value.imageUrl,
+    priceHT,
+    priceTTC,
+    taxRate: product.value.taxRate,
+    stock: currentStock.value,
+    quantity: quantity.value
+  }
+}
+
 function addToCart(): void {
+  cartError.value = ''
   if (!product.value) return
   if (currentStock.value === 0) return
 
   const cart = useCartStore()
+  const item = buildCartItem()
+  if (!item) return
 
-  const item = {
-    productId: product.value.id,
-    combinationId: selectedCombination.value?.id,
-    name: product.value.name,
-    imageUrl: product.value.imageUrl,
-    price: selectedCombination.value ? selectedCombination.value.price : product.value.priceTTC,
-    quantity: quantity.value
+  const result = cart.addItem(item)
+  if (!result.success) {
+    cartError.value = result.error || 'Stock insuffisant.'
+    return
   }
-
-  cart.addItem(item)
 
   // Afficher la confirmation pendant 2 secondes
   addedToCart.value = true
@@ -309,20 +340,19 @@ function addToCart(): void {
 }
 
 function continueShopping(): void {
+  cartError.value = ''
   if (!product.value) return
   if (currentStock.value === 0) return
 
   const cart = useCartStore()
-  const item = {
-    productId: product.value.id,
-    combinationId: selectedCombination.value?.id,
-    name: product.value.name,
-    imageUrl: product.value.imageUrl,
-    price: selectedCombination.value ? selectedCombination.value.price : product.value.priceTTC,
-    quantity: quantity.value
-  }
+  const item = buildCartItem()
+  if (!item) return
 
-  cart.addItem(item)
+  const result = cart.addItem(item)
+  if (!result.success) {
+    cartError.value = result.error || 'Stock insuffisant.'
+    return
+  }
   // retourner à la liste produits / home pour continuer les achats
   router.push('/home')
 }
@@ -489,6 +519,12 @@ onMounted(() => {
 
 .product-detail__confirmation {
   color: green;
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.product-detail__error {
+  color: #c0392b;
   font-size: 0.9rem;
   margin: 0;
 }

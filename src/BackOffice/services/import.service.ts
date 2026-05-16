@@ -982,6 +982,9 @@ export async function importCommandes(
   const orderStateMap: Record<string, string> = {
     'en attente paiement a la livraison': '13',
     'paiement accepte': '2',
+    'paiement effectue': '2',
+    'annule': '6',
+    'annulee': '6',
     'erreur de paiement': '8',
   };
 

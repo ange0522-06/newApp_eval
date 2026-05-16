@@ -137,6 +137,8 @@ function formatPrice(priceStr: string, conversionRateStr?: string): string {
  */
   function getStateBadgeClass(stateId: string): string {
   switch (stateId) {
+    case '13':
+      return 'info'; // Paiement a la livraison
     case '2':
       return 'success'; // Paiement effectué → vert
     case '6':
@@ -189,6 +191,7 @@ async function changeOrderState(order: Order, newStateId: string): Promise<void>
     if (success) {
       // Mettre à jour localement le tableau (sans recharger)
       const stateNameMap: { [key: string]: string } = {
+        '13': 'Paiement a la livraison',
         '2': 'Paiement effectué',
         '6': 'Annulé',
         '8': 'Échec paiement',
