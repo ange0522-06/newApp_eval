@@ -331,36 +331,6 @@ export async function getProductById(id: string): Promise<ProductDetail> {
 /**
  * Récupère toutes les catégories (hors racine et accueil)
  */
-type DatabaseCategoryResponse = {
-  success?: boolean
-  categories?: Array<{
-    id: string | number
-    name: string
-    parent_id?: string | number | null
-  }>
-}
-
-async function getDatabaseCategories(): Promise<Category[]> {
-  try {
-    const response = await fetch('/newapp-api/categories-lang.php?id_lang=1')
-    if (!response.ok) return []
-
-    const payload = await response.json() as DatabaseCategoryResponse
-    if (!payload.success || !Array.isArray(payload.categories)) return []
-
-    return payload.categories
-      .map(category => ({
-        id: String(category.id),
-        name: category.name || `CatÃ©gorie ${category.id}`,
-        parent_id: category.parent_id !== null && category.parent_id !== undefined
-          ? String(category.parent_id)
-          : undefined,
-      }))
-      .filter(category => category.id !== '1' && category.id !== '2')
-  } catch {
-    return []
-  }
-}
 
 function labelDuplicateCategoryNames(categories: Category[]): Category[] {
   const nameCounts = categories.reduce((counts, category) => {
@@ -403,18 +373,10 @@ export async function getAllCategories(): Promise<Category[]> {
       }
     }
 
-    const merged = new Map<string, Category>()
-    for (const category of await getDatabaseCategories()) {
-      merged.set(category.id, category)
-    }
-    for (const category of categories) {
-      merged.set(category.id, category)
-    }
-
-    return labelDuplicateCategoryNames(Array.from(merged.values()))
+    return labelDuplicateCategoryNames(categories)
       .sort((a, b) => a.name.localeCompare(b.name))
   } catch (error) {
     console.error('Erreur getAllCategories:', error)
-    return getDatabaseCategories()
+    return []
   }
 }

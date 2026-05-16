@@ -184,7 +184,7 @@ function goRegister(): void {
 }
 
 function goBackOffice(): void {
-  router.push('/back/login')
+  router.push('../back/login')
 }
 
 onMounted(loadCustomers)

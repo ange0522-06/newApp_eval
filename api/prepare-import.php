@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/prestashop-webservice.php';
+
 header('Content-Type: application/json; charset=utf-8');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -15,65 +17,82 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit;
 }
 
-function clean_prefix(string $prefix): string
+function prepare_update_configuration(string $name, string $value, array &$updated, array &$skipped): void
 {
-    return preg_replace('/[^a-zA-Z0-9_]/', '', $prefix) ?: 'ps_';
-}
+    try {
+        $ids = ps_find_ids_by_field('configurations', 'name', $name);
+        if (!$ids) {
+            $skipped[] = 'configuration ' . $name . ' introuvable';
+            return;
+        }
 
-function table_name(string $prefix, string $table): string
-{
-    return '`' . $prefix . $table . '`';
+        foreach ($ids as $id) {
+            try {
+                ps_update_resource_fields('configurations', $id, ['value' => $value]);
+                $updated[] = 'configuration ' . $name;
+            } catch (Throwable $exception) {
+                $skipped[] = 'configuration ' . $name . ' / ' . $id . ' impossible: ' . $exception->getMessage();
+            }
+        }
+    } catch (Throwable $exception) {
+        $skipped[] = 'configuration ' . $name . ' impossible: ' . $exception->getMessage();
+    }
 }
 
 try {
-    $config = require __DIR__ . '/../../eval/app/config/parameters.php';
-    $params = $config['parameters'] ?? [];
+    $updated = [];
+    $skipped = [];
 
-    $host = (string) ($params['database_host'] ?? '127.0.0.1');
-    $port = (string) ($params['database_port'] ?? '');
-    $dbName = (string) ($params['database_name'] ?? '');
-    $dbUser = (string) ($params['database_user'] ?? '');
-    $dbPassword = (string) ($params['database_password'] ?? '');
-    $prefix = clean_prefix((string) ($params['database_prefix'] ?? 'ps_'));
+    prepare_update_configuration('PS_SSL_ENABLED', '0', $updated, $skipped);
+    prepare_update_configuration('PS_SSL_ENABLED_EVERYWHERE', '0', $updated, $skipped);
 
-    $dsn = 'mysql:host=' . $host . ($port !== '' ? ';port=' . $port : '') . ';dbname=' . $dbName . ';charset=utf8mb4';
-    $pdo = new PDO($dsn, $dbUser, $dbPassword, [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    ]);
+    try {
+        $shopUrlIds = ps_find_ids_by_field('shop_urls', 'id_shop', 1);
+        if (!$shopUrlIds) {
+            $skipped[] = 'shop_url id_shop=1 introuvable';
+        }
 
-    $configuration = table_name($prefix, 'configuration');
-    $statement = $pdo->prepare(
-        'UPDATE ' . $configuration . '
-         SET value = :value, date_upd = NOW()
-         WHERE name IN (:ssl_enabled, :ssl_everywhere)'
-    );
-    $statement->execute([
-        'value' => '0',
-        'ssl_enabled' => 'PS_SSL_ENABLED',
-        'ssl_everywhere' => 'PS_SSL_ENABLED_EVERYWHERE',
-    ]);
+        foreach ($shopUrlIds as $id) {
+            try {
+                ps_update_resource_fields('shop_urls', $id, [
+                    'domain' => 'localhost',
+                    'domain_ssl' => 'localhost',
+                    'physical_uri' => '/e-commerce/eval/',
+                    'virtual_uri' => '',
+                    'main' => '1',
+                    'active' => '1',
+                ]);
+                $updated[] = 'shop_urls ' . $id;
+            } catch (Throwable $exception) {
+                $skipped[] = 'shop_url ' . $id . ' impossible: ' . $exception->getMessage();
+            }
+        }
+    } catch (Throwable $exception) {
+        $skipped[] = 'shop_urls impossible: ' . $exception->getMessage();
+    }
 
-    $shopUrl = table_name($prefix, 'shop_url');
-    $pdo->exec(
-        'UPDATE ' . $shopUrl . "
-         SET domain = 'localhost',
-             domain_ssl = 'localhost',
-             physical_uri = '/e-commerce/eval/',
-             virtual_uri = '',
-             main = 1,
-             active = 1
-         WHERE id_shop = 1"
-    );
+    $message = 'Configuration locale PrestaShop preparee via API XML.';
+    if (!empty($skipped)) {
+        $message .= ' Certaines modifications ont ete ignorees.';
+    }
 
     echo json_encode([
         'success' => true,
-        'message' => 'Configuration locale PrestaShop preparee pour import HTTP.',
+        'message' => $message,
+        'details' => [
+            'updated' => $updated,
+            'skipped' => $skipped,
+        ],
     ]);
 } catch (Throwable $exception) {
-    http_response_code(500);
+    http_response_code(200);
     echo json_encode([
-        'success' => false,
-        'message' => 'Preparation import impossible: ' . $exception->getMessage(),
+        'success' => true,
+        'message' => 'Configuration locale PrestaShop preparee avec avertissements.',
+        'details' => [
+            'updated' => $updated ?? [],
+            'skipped' => array_merge($skipped ?? [], ['preparation globale impossible: ' . $exception->getMessage()]),
+        ],
     ]);
 }
+

@@ -15,22 +15,22 @@
 
       <div class="file-grid">
         <label>
-          Fichier 1 - Produits
+          Fichier 1 
           <input ref="file1Input" type="file" accept=".csv" @change="handleFileChange($event, 1)" />
         </label>
 
         <label>
-          Fichier 2 - Declinaisons / stock
+          Fichier 2 
           <input ref="file2Input" type="file" accept=".csv" @change="handleFileChange($event, 2)" />
         </label>
 
         <label>
-          Fichier 3 - Clients / paniers / commandes
+          Fichier 3 
           <input ref="file3Input" type="file" accept=".csv" @change="handleFileChange($event, 3)" />
         </label>
 
         <label>
-          Fichier 4 - Images
+          Fichier 4 
           <input ref="zipInput" type="file" accept=".zip" @change="handleFileChange($event, 4)" />
         </label>
       </div>

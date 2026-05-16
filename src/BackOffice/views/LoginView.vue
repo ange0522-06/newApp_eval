@@ -82,7 +82,7 @@ async function handleLogin() {
 
   if (success) {
     // Si une redirection est demandée (ex: /checkout), respecter
-    const redirect = (route.query.redirect as string) || '/back/import'
+    const redirect = (route.query.redirect as string) || '/back/dashboard';
     router.push(redirect)
   }
 }

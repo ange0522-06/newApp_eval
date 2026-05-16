@@ -10,11 +10,11 @@ interface AuthResponse {
 
 /**
  * Service d'authentification back-office.
- * Le mot de passe employe est verifie cote PHP avec le systeme de hash PrestaShop.
+ * Le mot de passe employe est verifie cote PHP apres lecture via l'API XML PrestaShop.
  */
 class AuthService {
   /**
-   * Authentifie l'utilisateur via la table employee PrestaShop.
+   * Authentifie l'utilisateur via la ressource employees du Webservice PrestaShop.
    */
   async login(email: string, password: string): Promise<AuthResponse> {
     try {

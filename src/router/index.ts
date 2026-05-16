@@ -31,14 +31,21 @@ const routes: RouteRecordRaw[] = [
   // ==================== Landing Page ====================
   {
     path: '/',
-    name: 'CustomerSelect',
-    component: CustomerSelectView,
+    name: 'Landing',
+    component: LandingView,
     meta: { requiresAuth: false },
   },
   {
     path: '/landing',
-    name: 'Landing',
     component: LandingView,
+    meta: { requiresAuth: false },
+  },
+
+  // ==================== Front-Office entry ====================
+  {
+    path: '/front/customers',
+    name: 'CustomerSelect',
+    component: CustomerSelectView,
     meta: { requiresAuth: false },
   },
 
@@ -123,6 +130,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
 
+  // Toute URL /back inconnue doit revenir au login BO
+  {
+    path: '/back/:pathMatch(.*)*',
+    redirect: '/back/login',
+  },
+
   // Catch-all - redirige vers back office par défaut
   {
     path: '/:pathMatch(.*)*',
@@ -176,7 +189,7 @@ router.beforeEach((to, from) => {
   else if (to.path === '/back/login' && isBackOfficeAuthenticated) {
     console.log(`✓ User déjà auth, redirection vers import`);
     return '/back/import';
-  } else if ((to.path === '/login' || to.path === '/register' || to.path === '/') && isCustomerAuthenticated) {
+  } else if ((to.path === '/login' || to.path === '/register') && isCustomerAuthenticated) {
     console.log(`✓ Client déjà connecté, redirection vers home`);
     return typeof to.query.redirect === 'string' ? to.query.redirect : '/home';
   }

@@ -1,6 +1,7 @@
 type ResetDetails = {
   deleted?: Record<string, number> | string[];
   skipped?: string[];
+  failed?: string[];
 };
 
 type ResetApiResponse = {
@@ -54,7 +55,7 @@ export async function resetAll(): Promise<ResetResult> {
     details: {
       deleted: normalizeDeleted(data.details),
       skipped: data.details?.skipped || [],
-      failed: [],
+      failed: data.details?.failed || [],
     },
   };
 }

@@ -39,6 +39,6 @@ const goToBO = () => {
 };
 
 const goToFO = () => {
-  router.push('/home');
+  router.push('/front/customers');
 };
 </script>

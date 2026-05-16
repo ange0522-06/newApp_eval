@@ -47,16 +47,24 @@ type CombinationInfo = {
 const productsByReference = new Map<string, ProductInfo>();
 const combinationsByReferenceAndValue = new Map<string, CombinationInfo>();
 const resourceFullCache = new Map<string, Map<string, Record<string, string>>>();
+const resourceFullInflight = new Map<string, Promise<Map<string, Record<string, string>>>>();
 const stockAvailableByProductKey = new Map<string, string>();
 const combinationIdByProductAndValueId = new Map<string, string>();
+const productOptionInflight = new Map<string, Promise<string>>();
+const productOptionValueInflight = new Map<string, Promise<string>>();
+const customerInflight = new Map<string, Promise<{ id: string; secureKey: string }>>();
 let stockAvailableCacheLoaded = false;
 let combinationCacheLoaded = false;
 let defaultCountryId: string | null = null;
 
 function resetImportCaches(): void {
   resourceFullCache.clear();
+  resourceFullInflight.clear();
   stockAvailableByProductKey.clear();
   combinationIdByProductAndValueId.clear();
+  productOptionInflight.clear();
+  productOptionValueInflight.clear();
+  customerInflight.clear();
   stockAvailableCacheLoaded = false;
   combinationCacheLoaded = false;
   defaultCountryId = null;
@@ -124,6 +132,13 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+async function processInBatches<T>(items: T[], batchSize: number, handler: (item: T, index: number) => Promise<void>): Promise<void> {
+  for (let start = 0; start < items.length; start += batchSize) {
+    const batch = items.slice(start, start + batchSize);
+    await Promise.all(batch.map((item, offset) => handler(item, start + offset)));
+  }
+}
+
 async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Response> {
   let lastResponse: Response | null = null;
 
@@ -148,29 +163,41 @@ async function loadFullResource(resource: string): Promise<Map<string, Record<st
   const cached = resourceFullCache.get(resource);
   if (cached) return cached;
 
-  const response = await fetchResourceWithRetry(resource);
+  const inflight = resourceFullInflight.get(resource);
+  if (inflight) return inflight;
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
+  const promise = (async () => {
+    const response = await fetchResourceWithRetry(resource);
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
+    }
+
+    const xmlText = await response.text();
+    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+    const singular = getSingularResourceName(resource);
+    const container = doc.querySelector(resource);
+    const nodes = container
+      ? Array.from(container.children).filter((child) => child.tagName === singular)
+      : Array.from(doc.querySelectorAll(singular));
+    const map = new Map<string, Record<string, string>>();
+
+    for (const node of nodes) {
+      const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
+      if (id) map.set(id, readResourceNode(node));
+    }
+
+    resourceFullCache.set(resource, map);
+    return map;
+  })();
+
+  resourceFullInflight.set(resource, promise);
+  try {
+    return await promise;
+  } finally {
+    resourceFullInflight.delete(resource);
   }
-
-  const xmlText = await response.text();
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const singular = getSingularResourceName(resource);
-  const container = doc.querySelector(resource);
-  const nodes = container
-    ? Array.from(container.children).filter((child) => child.tagName === singular)
-    : Array.from(doc.querySelectorAll(singular));
-  const map = new Map<string, Record<string, string>>();
-
-  for (const node of nodes) {
-    const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
-    if (id) map.set(id, readResourceNode(node));
-  }
-
-  resourceFullCache.set(resource, map);
-  return map;
 }
 
 function cacheResource(resource: string, id: string, data: Record<string, string>): void {
@@ -497,12 +524,17 @@ async function uploadImagesWithLimit(
 }
 
 async function ensureProductOption(name: string, transaction: ImportTransaction): Promise<string> {
-  const existing = await findByField('product_options', 'name', name);
-  if (existing) return existing;
+  const cacheKey = normalize(name);
+  const inflight = productOptionInflight.get(cacheKey);
+  if (inflight) return inflight;
 
-  const id = await postRequired(
-    'product_options',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  const promise = (async () => {
+    const existing = await findByField('product_options', 'name', name);
+    if (existing) return existing;
+
+    const id = await postRequired(
+      'product_options',
+      `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <product_option>
     <is_color_group>${normalize(name) === 'couleur' ? 1 : 0}</is_color_group>
@@ -512,28 +544,41 @@ async function ensureProductOption(name: string, transaction: ImportTransaction)
     <public_name><language id="${ID_LANG}">${cdata(name)}</language></public_name>
   </product_option>
 </prestashop>`,
-    `Groupe attribut ${name}`
-  );
-  transaction.trackResource('fichier2', 'product_options', id);
-  cacheResource('product_options', id, {
-    name,
-    public_name: name,
-    is_color_group: normalize(name) === 'couleur' ? '1' : '0',
-  });
-  return id;
+      `Groupe attribut ${name}`
+    );
+    transaction.trackResource('fichier2', 'product_options', id);
+    cacheResource('product_options', id, {
+      name,
+      public_name: name,
+      is_color_group: normalize(name) === 'couleur' ? '1' : '0',
+    });
+    return id;
+  })();
+
+  productOptionInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    productOptionInflight.delete(cacheKey);
+  }
 }
 
 async function ensureProductOptionValue(groupId: string, value: string, transaction: ImportTransaction): Promise<string> {
-  const values = await loadFullResource('product_option_values');
-  for (const [id, data] of values) {
-    if (data.id_attribute_group === groupId && normalize(data.name || '') === normalize(value)) {
-      return id;
-    }
-  }
+  const cacheKey = `${groupId}::${normalize(value)}`;
+  const inflight = productOptionValueInflight.get(cacheKey);
+  if (inflight) return inflight;
 
-  const id = await postRequired(
-    'product_option_values',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  const promise = (async () => {
+    const values = await loadFullResource('product_option_values');
+    for (const [id, data] of values) {
+      if (data.id_attribute_group === groupId && normalize(data.name || '') === normalize(value)) {
+        return id;
+      }
+    }
+
+    const id = await postRequired(
+      'product_option_values',
+      `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <product_option_value>
     <id_attribute_group>${groupId}</id_attribute_group>
@@ -542,11 +587,19 @@ async function ensureProductOptionValue(groupId: string, value: string, transact
     <name><language id="${ID_LANG}">${cdata(value)}</language></name>
   </product_option_value>
 </prestashop>`,
-    `Valeur attribut ${value}`
-  );
-  transaction.trackResource('fichier2', 'product_option_values', id);
-  cacheResource('product_option_values', id, { id_attribute_group: groupId, name: value });
-  return id;
+      `Valeur attribut ${value}`
+    );
+    transaction.trackResource('fichier2', 'product_option_values', id);
+    cacheResource('product_option_values', id, { id_attribute_group: groupId, name: value });
+    return id;
+  })();
+
+  productOptionValueInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    productOptionValueInflight.delete(cacheKey);
+  }
 }
 
 function combinationKey(reference: string, karazany: string): string {
@@ -823,9 +876,8 @@ export async function importDeclinaisons(
     loadFullResource('product_option_values'),
   ]);
 
-  for (let i = 0; i < rows.length; i++) {
-    const rowNumber = i + 2;
-    const row = rows[i];
+  await processInBatches(rows, 4, async (row, index) => {
+    const rowNumber = index + 2;
     const reference = getColumnValue(headers, row, 'reference');
     const specificite = getColumnValue(headers, row, 'specificite');
     const karazany = getColumnValue(headers, row, 'karazany');
@@ -841,7 +893,7 @@ export async function importDeclinaisons(
 
     if (!specificite && !karazany) {
       await updateStock(transaction, 'fichier2', product.id, '0', stockInitial);
-      continue;
+      return;
     }
 
     if (!specificite || !karazany) {
@@ -890,7 +942,7 @@ export async function importDeclinaisons(
       priceHT: product.priceHT + priceImpactHT,
       priceTTC,
     });
-  }
+  });
 
   transaction.markStepSuccess('fichier2');
 }
@@ -907,13 +959,18 @@ async function getDefaultCarrierId(): Promise<string> {
 }
 
 async function ensureCustomer(email: string, name: string, password: string, date: string, transaction: ImportTransaction): Promise<{ id: string; secureKey: string }> {
-  const existing = await findRecordByField('customers', 'email', email);
-  let id = existing?.id || null;
-  let data = existing?.data || null;
-  if (!id) {
-    id = await postRequired(
-      'customers',
-      `<?xml version="1.0" encoding="UTF-8"?>
+  const cacheKey = normalize(email);
+  const inflight = customerInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const existing = await findRecordByField('customers', 'email', email);
+    let id = existing?.id || null;
+    let data = existing?.data || null;
+    if (!id) {
+      id = await postRequired(
+        'customers',
+        `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <customer>
     <id_default_group>${DEFAULT_CUSTOMER_GROUP}</id_default_group>
@@ -931,14 +988,22 @@ async function ensureCustomer(email: string, name: string, password: string, dat
     <associations><groups><group><id>${DEFAULT_CUSTOMER_GROUP}</id></group></groups></associations>
   </customer>
 </prestashop>`,
-      `Client ${email}`
-    );
-    transaction.trackResource('fichier3', 'customers', id);
-    data = (await getOne('customers', id)) as unknown as Record<string, string>;
-    cacheResource('customers', id, data);
-  }
+        `Client ${email}`
+      );
+      transaction.trackResource('fichier3', 'customers', id);
+      data = (await getOne('customers', id)) as unknown as Record<string, string>;
+      cacheResource('customers', id, data);
+    }
 
-  return { id, secureKey: data?.secure_key || '-1' };
+    return { id, secureKey: data?.secure_key || '-1' };
+  })();
+
+  customerInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    customerInflight.delete(cacheKey);
+  }
 }
 
 function resolveCartItem(item: { reference: string; quantite: number; karazany: string }) {
@@ -991,9 +1056,8 @@ export async function importCommandes(
   const carrierId = await getDefaultCarrierId();
   const countryId = await getDefaultCountryId();
 
-  for (let i = 0; i < rows.length; i++) {
-    const rowNumber = i + 2;
-    const row = rows[i];
+  await processInBatches(rows, 4, async (row, index) => {
+    const rowNumber = index + 2;
     const date = parseDate(getColumnValue(headers, row, 'date'));
     const name = getColumnValue(headers, row, 'nom');
     const email = getColumnValue(headers, row, 'email');
@@ -1070,7 +1134,7 @@ export async function importCommandes(
     transaction.trackResource('fichier3', 'carts', cartId);
 
     if (!stateRaw.trim()) {
-      continue;
+      return;
     }
 
     const orderStateId = orderStateMap[stateKey];
@@ -1160,7 +1224,7 @@ export async function importCommandes(
       `Historique commande ${orderId}`
     );
     transaction.trackResource('fichier3', 'order_histories', historyId);
-  }
+  });
 
   transaction.markStepSuccess('fichier3');
 }
