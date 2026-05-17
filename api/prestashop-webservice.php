@@ -131,7 +131,9 @@ function ps_ws_request(string $method, string $path, array $query = [], ?string 
     $responseBody = curl_exec($ch);
     $curlError = curl_error($ch);
     $statusCode = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
+    if (PHP_VERSION_ID < 80500) {
+        curl_close($ch);
+    }
 
     if ($responseBody === false) {
         throw new PrestaShopWebserviceException('Appel Webservice impossible: ' . $curlError);
@@ -340,6 +342,11 @@ function ps_put_resource_xml(string $resource, int $id, string $xml): void
     ps_ws_request('PUT', $resource . '/' . $id, [], $xml);
 }
 
+function ps_patch_resource_xml(string $resource, int $id, string $xml): void
+{
+    ps_ws_request('PATCH', $resource . '/' . $id, [], $xml);
+}
+
 function ps_update_resource_fields(string $resource, int $id, array $fields): void
 {
     $doc = ps_load_dom(ps_get_resource_xml($resource, $id));
@@ -354,7 +361,10 @@ function ps_update_resource_fields(string $resource, int $id, array $fields): vo
         ps_set_dom_text($element, (string) $name, $value);
     }
 
-    ps_put_resource_xml($resource, $id, $doc->saveXML());
+    // PATCH preserves fields omitted from the XML. With PUT, PrestaShop sets
+    // omitted optional fields to null before validation, which breaks resources
+    // such as Configuration when read-only date_add/date_upd are removed.
+    ps_patch_resource_xml($resource, $id, $doc->saveXML());
 }
 
 function ps_delete_resource(string $resource, int $id): void

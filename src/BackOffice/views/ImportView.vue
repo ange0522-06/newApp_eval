@@ -201,8 +201,8 @@ async function prepareImportEnvironment(): Promise<void> {
 }
 
 async function importAll(): Promise<void> {
-  if (!file1.value || !file2.value || !file3.value || !zipFile.value) {
-    globalMessage.value = 'Les 4 fichiers sont requis.';
+  if (!file1.value || !file2.value || !file3.value) {
+    globalMessage.value = 'Les 3 fichiers CSV sont requis. Le fichier ZIP (images) est optionnel.';
     globalMessageStatus.value = 'error';
     return;
   }
@@ -210,22 +210,22 @@ async function importAll(): Promise<void> {
   resetImportProgress();
   isImportingAll.value = true;
   const importStartTime = performance.now();
-  globalMessage.value = 'Import en cours: les 4 fichiers seront valides ensemble.';
+  globalMessage.value = 'Import en cours: les 3 fichiers CSV seront valides ensemble. Images optionnelles.';
   globalMessageStatus.value = 'info';
   let currentStep: ImportStepKey = 'validation';
 
   const transaction = new ImportTransaction();
 
   try {
-    setStepStatus('validation', 'running', 'Lecture et controle des formats CSV/ZIP.');
+    setStepStatus('validation', 'running', 'Lecture et controle des formats CSV' + (zipFile.value ? '/ZIP' : '') + '.');
     await prepareImportEnvironment();
     const [csv1, csv2, csv3, images] = await Promise.all([
       parseTypedCsv(file1.value, 'produits'),
       parseTypedCsv(file2.value, 'declinaisons'),
       parseTypedCsv(file3.value, 'commandes'),
-      extractImagesFromZip(zipFile.value),
+      zipFile.value ? extractImagesFromZip(zipFile.value) : Promise.resolve({}),
     ]);
-    setStepStatus('validation', 'success', 'Les 4 fichiers sont lisibles et au bon format.');
+    setStepStatus('validation', 'success', 'Les fichiers CSV sont lisibles et au bon format' + (zipFile.value ? '. ZIP valide.' : '.'));
 
     currentStep = 'fichier1';
     setStepStatus('fichier1', 'running', 'Import des produits en cours.');
@@ -233,9 +233,13 @@ async function importAll(): Promise<void> {
     setStepStatus('fichier1', 'success', `${csv1.rows.length} ligne(s) traitee(s).`);
 
     currentStep = 'images';
-    setStepStatus('images', 'running', 'Import des images produits en cours.');
-    await importImages(images, transaction);
-    setStepStatus('images', 'success', `${Object.keys(images).length} image(s) lue(s) dans le ZIP.`);
+    if (zipFile.value && Object.keys(images).length > 0) {
+      setStepStatus('images', 'running', 'Import des images produits en cours.');
+      await importImages(images, transaction);
+      setStepStatus('images', 'success', `${Object.keys(images).length} image(s) importee(s).`);
+    } else {
+      setStepStatus('images', 'success', 'Pas d\'images a importer (ZIP non fourni ou vide).');
+    }
 
     currentStep = 'fichier2';
     setStepStatus('fichier2', 'running', 'Import des declinaisons et stocks en cours.');

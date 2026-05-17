@@ -506,8 +506,9 @@ async function uploadImagesWithLimit(
       const product = products[nextIndex];
       nextIndex += 1;
       const image = imageMap[product.reference];
+      // Skip if image not found - images are optional
       if (!image) {
-        throw new Error(`Image manquante dans le zip pour la reference ${product.reference}`);
+        continue;
       }
 
       const result = await uploadProductImage(product.id, imagePayloadToFile(image));
@@ -743,7 +744,7 @@ export async function extractImagesFromZip(zipFile: File): Promise<Record<string
     };
   }
 
-  if (!Object.keys(images).length) throw new Error('Aucune image valide dans images.zip');
+  // Return empty object if no images found - import continues without images
   return images;
 }
 
@@ -1051,6 +1052,7 @@ export async function importCommandes(
     'annule': '6',
     'annulee': '6',
     'erreur de paiement': '8',
+    'dans le panier': '', // Empty state = cart only, no order
   };
 
   const carrierId = await getDefaultCarrierId();
@@ -1133,7 +1135,9 @@ export async function importCommandes(
     );
     transaction.trackResource('fichier3', 'carts', cartId);
 
-    if (!stateRaw.trim()) {
+    // Check if state indicates cart-only (no order)
+    const isCartOnly = !stateRaw.trim() || stateKey === 'dans le panier';
+    if (isCartOnly) {
       return;
     }
 

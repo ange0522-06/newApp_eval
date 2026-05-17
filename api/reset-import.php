@@ -2,9 +2,16 @@
 
 declare(strict_types=1);
 
-require_once __DIR__ . '/prestashop-webservice.php';
+// Set error handling before any output
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
 
-header('Content-Type: application/json; charset=utf-8');
+// Header must be first
+header('Content-Type: text/xml; charset=utf-8');
+
+// Then load dependencies with error suppression
+require_once __DIR__ . '/prestashop-webservice.php';
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(204);
@@ -13,7 +20,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode(['success' => false, 'message' => 'Method not allowed']);
+    echo '<?xml version="1.0" encoding="UTF-8"?><prestashop><error>Method not allowed</error></prestashop>';
     exit;
 }
 
@@ -150,7 +157,8 @@ try {
     $failed = [];
     $protectedCustomerData = reset_protected_customer_data($protectedCustomerIds, $skipped);
 
-    $deletePlan = [
+    // Step 1: Delete order-related data (respects protected customers automatically)
+    $orderDeletions = [
         'order_histories',
         'order_payments',
         'order_details',
@@ -159,29 +167,100 @@ try {
         'order_invoices',
         'order_slips',
         'orders',
+    ];
+
+    foreach ($orderDeletions as $resource) {
+        $ids = reset_list_ids_safe($resource, $skipped);
+        if (!empty($protectedCustomerData[$resource])) {
+            $ids = array_values(array_diff($ids, $protectedCustomerData[$resource]));
+        }
+        reset_delete_ids($resource, $ids, $deleted, $failed);
+    }
+
+    // Step 2: Delete cart-related data (respects protected customers)
+    $cartDeletions = [
         'cart_rules',
         'carts',
         'addresses',
         'customers',
-        'stock_availables',
-        'combinations',
-        'products',
+    ];
+
+    foreach ($cartDeletions as $resource) {
+        $ids = reset_list_ids_safe($resource, $skipped);
+        if (!empty($protectedCustomerData[$resource])) {
+            $ids = array_values(array_diff($ids, $protectedCustomerData[$resource]));
+        }
+        reset_delete_ids($resource, $ids, $deleted, $failed);
+    }
+
+    // Step 3: Delete images before products/combinations
+    try {
+        $productIds = reset_list_ids_safe('products', $skipped);
+        $protectedProducts = $protectedCustomerData['products'] ?? [];
+        $productsToDelete = array_values(array_diff($productIds, $protectedProducts));
+        
+        if (!empty($productsToDelete)) {
+            foreach ($productsToDelete as $productId) {
+                try {
+                    $imageIds = ps_find_ids_by_field('images', 'id_product', $productId);
+                    if (!empty($imageIds)) {
+                        foreach ($imageIds as $imageId) {
+                            try {
+                                ps_delete_resource('images', $imageId);
+                                $deleted['images'] = ($deleted['images'] ?? 0) + 1;
+                            } catch (Throwable $e) {
+                                $failed[] = 'images/' . $imageId . ': ' . $e->getMessage();
+                            }
+                        }
+                    }
+                } catch (Throwable $e) {
+                    // Silently skip if finding images fails
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'images: ' . $e->getMessage();
+    }
+
+    // Step 4: Delete stock_availables before combinations/products
+    $stockIds = reset_list_ids_safe('stock_availables', $skipped);
+    reset_delete_ids('stock_availables', $stockIds, $deleted, $failed);
+
+    // Step 5: Delete combinations before products
+    $combinationIds = reset_list_ids_safe('combinations', $skipped);
+    reset_delete_ids('combinations', $combinationIds, $deleted, $failed);
+
+    // Step 6: Delete products
+    $ids = reset_list_ids_safe('products', $skipped);
+    if (!empty($protectedCustomerData['products'])) {
+        $ids = array_values(array_diff($ids, $protectedCustomerData['products']));
+    }
+    reset_delete_ids('products', $ids, $deleted, $failed);
+
+    // Step 7: Delete product options and values
+    $optionDeletions = [
         'product_option_values',
         'product_options',
+    ];
+
+    foreach ($optionDeletions as $resource) {
+        $ids = reset_list_ids_safe($resource, $skipped);
+        reset_delete_ids($resource, $ids, $deleted, $failed);
+    }
+
+    // Step 8: Delete tax-related data
+    $taxDeletions = [
         'tax_rules',
         'tax_rule_groups',
         'taxes',
     ];
 
-    foreach ($deletePlan as $resource) {
+    foreach ($taxDeletions as $resource) {
         $ids = reset_list_ids_safe($resource, $skipped);
-        if (!empty($protectedCustomerData[$resource])) {
-            $ids = array_values(array_diff($ids, $protectedCustomerData[$resource]));
-        }
-
         reset_delete_ids($resource, $ids, $deleted, $failed);
     }
 
+    // Step 9: Delete categories (except protected ones)
     reset_delete_ids('categories', reset_category_ids($protectedCategoryIds, $skipped), $deleted, $failed);
 
     foreach ($protectedCategoryIds as $id) {
@@ -190,27 +269,61 @@ try {
 
     $deletedCount = array_sum($deleted);
     $failedCount = count($failed);
+    // Success = at least something was deleted (partial reset is acceptable)
+    $success = $deletedCount > 0 || $failedCount === 0;
     $message = $failedCount > 0
-        ? 'Reset API XML termine avec ' . $failedCount . ' echec(s).'
+        ? 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s), ' . $failedCount . ' echec(s) (certaines donnees protegees peuvent rester).'
         : 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s). Categories 1 et 2, customer 1 et ses donnees liees sont conservees.';
 
-    echo json_encode([
-        'success' => true,
-        'message' => $message,
-        'deletedCount' => $deletedCount,
-        'skippedCount' => count($skipped),
-        'failedCount' => $failedCount,
-        'details' => [
-            'deleted' => $deleted,
-            'skipped' => $skipped,
-            'failed' => $failed,
-        ],
-    ]);
+    $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+    $xml .= '<prestashop success="' . ($success ? '1' : '0') . '" deletedCount="' . $deletedCount . '" skippedCount="' . count($skipped) . '" failedCount="' . $failedCount . '">' . "\n";
+    $xml .= '  <message>' . htmlspecialchars($message, ENT_XML1, 'UTF-8') . '</message>' . "\n";
+    $xml .= '  <details>' . "\n";
+    
+    // Deleted items
+    $xml .= '    <deleted>' . "\n";
+    foreach ($deleted as $resource => $count) {
+        $xml .= '      <item resource="' . htmlspecialchars($resource, ENT_XML1, 'UTF-8') . '">' . $count . '</item>' . "\n";
+    }
+    $xml .= '    </deleted>' . "\n";
+    
+    // Skipped items
+    $xml .= '    <skipped>' . "\n";
+    foreach ($skipped as $skip) {
+        $xml .= '      <item>' . htmlspecialchars($skip, ENT_XML1, 'UTF-8') . '</item>' . "\n";
+    }
+    $xml .= '    </skipped>' . "\n";
+    
+    // Failed items
+    $xml .= '    <failed>' . "\n";
+    foreach ($failed as $fail) {
+        $xml .= '      <item>' . htmlspecialchars($fail, ENT_XML1, 'UTF-8') . '</item>' . "\n";
+    }
+    $xml .= '    </failed>' . "\n";
+    
+    $xml .= '  </details>' . "\n";
+    $xml .= '</prestashop>';
+    
+    echo $xml;
 } catch (Throwable $exception) {
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Erreur reset API XML: ' . $exception->getMessage(),
-    ]);
+    $errorMessage = $exception->getMessage();
+    $errorClass = get_class($exception);
+    $errorLine = $exception->getLine();
+    $errorFile = $exception->getFile();
+    
+    $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+    $xml .= '<prestashop success="0" failedCount="1">' . "\n";
+    $xml .= '  <message>' . htmlspecialchars("Erreur reset API XML: {$errorMessage}", ENT_XML1, 'UTF-8') . '</message>' . "\n";
+    $xml .= '  <details>' . "\n";
+    $xml .= '    <error>' . "\n";
+    $xml .= '      <class>' . htmlspecialchars($errorClass, ENT_XML1, 'UTF-8') . '</class>' . "\n";
+    $xml .= '      <file>' . htmlspecialchars($errorFile, ENT_XML1, 'UTF-8') . '</file>' . "\n";
+    $xml .= '      <line>' . $errorLine . '</line>' . "\n";
+    $xml .= '    </error>' . "\n";
+    $xml .= '  </details>' . "\n";
+    $xml .= '</prestashop>';
+    
+    echo $xml;
 }
 

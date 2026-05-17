@@ -38,13 +38,54 @@ export async function resetAll(): Promise<ResetResult> {
   const response = await fetch('/newapp-api/reset-import.php', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/json',
+      'Content-Type': 'text/xml',
     },
+    body: '<?xml version="1.0" encoding="UTF-8"?><prestashop></prestashop>',
   });
 
-  const data = (await response.json().catch(() => null)) as ResetApiResponse | null;
-  if (!response.ok || !data?.success) {
-    throw new Error(data?.message || `Reset impossible: HTTP ${response.status}`);
+  let data: ResetApiResponse | null = null;
+  let responseText = '';
+
+  try {
+    responseText = await response.text();
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(responseText, 'text/xml');
+    
+    if (xmlDoc.documentElement.tagName === 'parsererror') {
+      throw new Error('Invalid XML response');
+    }
+
+    const root = xmlDoc.documentElement;
+    const success = root.getAttribute('success') === 'true' || root.getAttribute('success') === '1';
+    const message = root.querySelector('message')?.textContent || '';
+    const deletedCount = parseInt(root.getAttribute('deletedCount') || '0', 10);
+    const skippedCount = parseInt(root.getAttribute('skippedCount') || '0', 10);
+    const failedCount = parseInt(root.getAttribute('failedCount') || '0', 10);
+
+    data = {
+      success,
+      message,
+      deletedCount,
+      skippedCount,
+      failedCount,
+      details: {
+        deleted: Array.from(root.querySelectorAll('details > deleted > item')).map(el => el.textContent || ''),
+        skipped: Array.from(root.querySelectorAll('details > skipped > item')).map(el => el.textContent || ''),
+        failed: Array.from(root.querySelectorAll('details > failed > item')).map(el => el.textContent || ''),
+      },
+    };
+  } catch (parseError) {
+    console.error('XML parse error:', parseError, 'Response:', responseText);
+  }
+
+  // Check if response is ok
+  if (!response.ok) {
+    throw new Error(`Reset HTTP error ${response.status}: ${data?.message || responseText || 'Unknown error'}`);
+  }
+
+  // Accept reset even with some failures (orphaned products, etc.)
+  if (!data) {
+    throw new Error(`Reset failed: invalid response structure`);
   }
 
   return {
@@ -53,7 +94,7 @@ export async function resetAll(): Promise<ResetResult> {
     failedCount: data.failedCount || 0,
     message: data.message || 'Reset termine avec succes',
     details: {
-      deleted: normalizeDeleted(data.details),
+      deleted: data.details?.deleted || [],
       skipped: data.details?.skipped || [],
       failed: data.details?.failed || [],
     },
