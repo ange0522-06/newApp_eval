@@ -51,34 +51,8 @@
       </button>
     </div>
 
-    <form v-if="selectedCustomer" class="email-check" @submit.prevent="confirmCustomerEmail">
-      <div>
-        <h2>Verification e-mail</h2>
-        <p>
-          Entrez l'e-mail du compte
-          <strong>{{ selectedCustomer.firstname }} {{ selectedCustomer.lastname }}</strong>
-          pour continuer.
-        </p>
-      </div>
-      <label for="customer-email-check">E-mail</label>
-      <input
-        id="customer-email-check"
-        v-model.trim="verificationEmail"
-        type="email"
-        autocomplete="email"
-        required
-      />
-      <p v-if="verificationError" class="email-check__error">{{ verificationError }}</p>
-      <div class="email-check__actions">
-        <button type="submit">Valider</button>
-        <button type="button" @click="cancelEmailCheck">Annuler</button>
-      </div>
-    </form>
 
     <div class="customer-select__actions">
-      <button class="secondary-btn" type="button" @click="goLogin">
-        Connexion avec mot de passe
-      </button>
       <button class="secondary-btn" type="button" @click="goRegister">
         Nouveau client
       </button>
@@ -147,37 +121,18 @@ async function loadCustomers(): Promise<void> {
 function selectCustomer(customer: CustomerOption): void {
   if (!customer.active) return
 
-  selectedCustomer.value = customer
-  verificationEmail.value = ''
-  verificationError.value = ''
-}
-
-function confirmCustomerEmail(): void {
-  if (!selectedCustomer.value) return
-
-  if (normalizeEmail(verificationEmail.value) !== normalizeEmail(selectedCustomer.value.email)) {
-    verificationError.value = "L'e-mail ne correspond pas a cet utilisateur."
-    return
-  }
-
-  authenticateCustomer(selectedCustomer.value)
+  authenticateCustomer(customer)
   router.push(redirectTarget())
 }
 
-function cancelEmailCheck(): void {
-  selectedCustomer.value = null
-  verificationEmail.value = ''
-  verificationError.value = ''
-}
+
 
 function selectAnonymous(): void {
   authenticateAnonymousCustomer()
   router.push(redirectTarget())
 }
 
-function goLogin(): void {
-  router.push({ path: '/login', query: { redirect: redirectTarget() } })
-}
+
 
 function goRegister(): void {
   router.push({ path: '/register', query: { redirect: redirectTarget() } })

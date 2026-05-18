@@ -65,7 +65,10 @@ function reset_update_stock_quantities(array $ids, array &$updated, array &$fail
     $ids = reset_normalize_ids($ids);
     foreach ($ids as $id) {
         try {
-            ps_update_resource_fields('stock_availables', $id, ['quantity' => 0]);
+            $xml = '<?xml version="1.0" encoding="UTF-8"?><prestashop><stock_available><id>'
+                . $id
+                . '</id><quantity>0</quantity></stock_available></prestashop>';
+            ps_patch_resource_xml('stock_availables', $id, $xml);
             $updated['stock_availables'] = ($updated['stock_availables'] ?? 0) + 1;
         } catch (Throwable $exception) {
             $error = trim($exception->getMessage());
@@ -207,10 +210,249 @@ function reset_category_ids(array $protectedCategoryIds, array &$skipped): array
     }
 }
 
-try {
+function reset_xml_response(bool $success, string $message, array $deleted, array $updated, array $skipped, array $failed): string
+{
+    $deletedCount = array_sum($deleted);
+    $updatedCount = array_sum($updated);
+
+    $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+    $xml .= '<prestashop success="' . ($success ? '1' : '0') . '" deletedCount="' . $deletedCount . '" updatedCount="' . $updatedCount . '" skippedCount="' . count($skipped) . '" failedCount="' . count($failed) . '">' . "\n";
+    $xml .= '  <message>' . htmlspecialchars($message, ENT_XML1, 'UTF-8') . '</message>' . "\n";
+    $xml .= '  <details>' . "\n";
+    $xml .= '    <deleted>' . "\n";
+    foreach ($deleted as $resource => $count) {
+        $xml .= '      <item resource="' . htmlspecialchars($resource, ENT_XML1, 'UTF-8') . '">' . (int) $count . '</item>' . "\n";
+    }
+    $xml .= '    </deleted>' . "\n";
+    $xml .= '    <updated>' . "\n";
+    foreach ($updated as $resource => $count) {
+        $xml .= '      <item resource="' . htmlspecialchars($resource, ENT_XML1, 'UTF-8') . '">' . (int) $count . '</item>' . "\n";
+    }
+    $xml .= '    </updated>' . "\n";
+    $xml .= '    <skipped>' . "\n";
+    foreach ($skipped as $skip) {
+        $xml .= '      <item>' . htmlspecialchars($skip, ENT_XML1, 'UTF-8') . '</item>' . "\n";
+    }
+    $xml .= '    </skipped>' . "\n";
+    $xml .= '    <failed>' . "\n";
+    foreach ($failed as $fail) {
+        $xml .= '      <item>' . htmlspecialchars($fail, ENT_XML1, 'UTF-8') . '</item>' . "\n";
+    }
+    $xml .= '    </failed>' . "\n";
+    $xml .= '  </details>' . "\n";
+    $xml .= '</prestashop>';
+
+    return $xml;
+}
+
+function reset_fast_table_exists(PDO $pdo, string $prefix, string $table): bool
+{
+    static $cache = [];
+    $fullName = $prefix . $table;
+    if (array_key_exists($fullName, $cache)) {
+        return $cache[$fullName];
+    }
+
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table');
+    $stmt->execute(['table' => $fullName]);
+    $cache[$fullName] = (int) $stmt->fetchColumn() > 0;
+
+    return $cache[$fullName];
+}
+
+function reset_fast_delete(PDO $pdo, string $prefix, string $table, array &$deleted, array &$skipped, string $where = '1=1', array $params = []): void
+{
+    if (!reset_fast_table_exists($pdo, $prefix, $table)) {
+        $skipped[] = $prefix . $table . ' absente';
+        return;
+    }
+
+    $stmt = $pdo->prepare('DELETE FROM `' . $prefix . $table . '` WHERE ' . $where);
+    $stmt->execute($params);
+    $count = $stmt->rowCount();
+    if ($count > 0) {
+        $deleted[$table] = ($deleted[$table] ?? 0) + $count;
+    }
+}
+
+function reset_fast_auto_increment(PDO $pdo, string $prefix, string $table, int $nextId, array &$skipped): void
+{
+    if (!reset_fast_table_exists($pdo, $prefix, $table)) {
+        return;
+    }
+
+    try {
+        $pdo->exec('ALTER TABLE `' . $prefix . $table . '` AUTO_INCREMENT = ' . $nextId);
+    } catch (Throwable $exception) {
+        $skipped[] = $prefix . $table . ' auto_increment ignore: ' . $exception->getMessage();
+    }
+}
+
+function reset_fast_image_path(int $imageId): string
+{
+    return implode(DIRECTORY_SEPARATOR, str_split((string) $imageId));
+}
+
+function reset_fast_delete_image_files(array $imageIds, array &$deleted): void
+{
+    $baseDir = realpath(__DIR__ . '/../../eval/img/p');
+    if ($baseDir === false) {
+        return;
+    }
+
+    foreach ($imageIds as $imageId) {
+        $imageId = (int) $imageId;
+        if ($imageId <= 0) {
+            continue;
+        }
+
+        $dir = $baseDir . DIRECTORY_SEPARATOR . reset_fast_image_path($imageId);
+        foreach (glob($dir . DIRECTORY_SEPARATOR . $imageId . '*') ?: [] as $file) {
+            if (is_file($file) && @unlink($file)) {
+                $deleted['image_files'] = ($deleted['image_files'] ?? 0) + 1;
+            }
+        }
+
+        while ($dir !== $baseDir && is_dir($dir)) {
+            $items = array_diff(scandir($dir) ?: [], ['.', '..']);
+            if ($items) {
+                break;
+            }
+            @rmdir($dir);
+            $dir = dirname($dir);
+        }
+    }
+}
+
+function reset_fast_sql(): string
+{
+    $pdo = ps_pdo();
+    $prefix = ps_db_prefix();
     $deleted = [];
     $updated = [];
     $skipped = [];
+    $failed = [];
+
+    $imageIds = [];
+    if (reset_fast_table_exists($pdo, $prefix, 'image')) {
+        $imageIds = array_map('intval', $pdo->query('SELECT id_image FROM `' . $prefix . 'image`')->fetchAll(PDO::FETCH_COLUMN));
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $pdo->exec('SET FOREIGN_KEY_CHECKS = 0');
+
+        foreach ([
+            'order_invoice_payment',
+            'order_detail_tax',
+            'order_slip_detail',
+            'order_slip',
+            'order_payment',
+            'order_history',
+            'order_carrier',
+            'order_cart_rule',
+            'order_invoice_tax',
+            'order_invoice',
+            'order_detail',
+            'orders',
+            'cart_product',
+            'cart_cart_rule',
+            'cart_rule',
+        ] as $table) {
+            reset_fast_delete($pdo, $prefix, $table, $deleted, $skipped);
+        }
+
+        reset_fast_delete($pdo, $prefix, 'address', $deleted, $skipped, 'id_customer > 1 OR alias LIKE :alias', ['alias' => 'Adresse import%']);
+        reset_fast_delete($pdo, $prefix, 'customer_group', $deleted, $skipped, 'id_customer > 1');
+        reset_fast_delete($pdo, $prefix, 'customer', $deleted, $skipped, 'id_customer > 1');
+        reset_fast_delete($pdo, $prefix, 'cart', $deleted, $skipped);
+
+        foreach ([
+            'specific_price',
+            'specific_price_rule',
+            'stock_available',
+            'product_attribute_combination',
+            'product_attribute_shop',
+            'product_attribute_image',
+            'product_attribute',
+            'product_supplier',
+            'category_product',
+            'product_lang',
+            'product_shop',
+            'product',
+            'image_lang',
+            'image_shop',
+            'image',
+            'attribute_lang',
+            'attribute_shop',
+            'attribute',
+            'attribute_group_lang',
+            'attribute_group_shop',
+            'attribute_group',
+            'tax_rule',
+            'tax_rules_group',
+            'tax_lang',
+            'tax',
+            'category_group',
+            'category_lang',
+            'category_shop',
+        ] as $table) {
+            if (str_starts_with($table, 'category_') && $table !== 'category_product') {
+                reset_fast_delete($pdo, $prefix, $table, $deleted, $skipped, 'id_category > 2');
+            } else {
+                reset_fast_delete($pdo, $prefix, $table, $deleted, $skipped);
+            }
+        }
+        reset_fast_delete($pdo, $prefix, 'category', $deleted, $skipped, 'id_category > 2');
+
+        foreach ([
+            'orders' => 1,
+            'cart' => 1,
+            'address' => 1,
+            'customer' => 2,
+            'product' => 1,
+            'product_attribute' => 1,
+            'stock_available' => 1,
+            'image' => 1,
+            'attribute' => 1,
+            'attribute_group' => 1,
+            'tax' => 1,
+            'tax_rule' => 1,
+            'tax_rules_group' => 1,
+            'category' => 3,
+        ] as $table => $nextId) {
+            reset_fast_auto_increment($pdo, $prefix, $table, $nextId, $skipped);
+        }
+
+        $pdo->exec('SET FOREIGN_KEY_CHECKS = 1');
+        $pdo->commit();
+    } catch (Throwable $exception) {
+        try {
+            $pdo->exec('SET FOREIGN_KEY_CHECKS = 1');
+        } catch (Throwable) {
+        }
+        $pdo->rollBack();
+        throw $exception;
+    }
+
+    reset_fast_delete_image_files($imageIds, $deleted);
+
+    $message = 'Reset SQL rapide termine: ' . array_sum($deleted) . ' element(s) supprime(s).';
+    return reset_xml_response(true, $message, $deleted, $updated, $skipped, $failed);
+}
+
+try {
+    try {
+        echo reset_fast_sql();
+        exit;
+    } catch (Throwable $fastException) {
+        // Fallback API XML si PDO/MySQL direct n'est pas disponible.
+        $fastResetError = $fastException->getMessage();
+    }
+
+    $deleted = [];
+    $updated = [];
+    $skipped = isset($fastResetError) ? ['reset SQL rapide indisponible: ' . $fastResetError] : [];
     $failed = [];
     $protectedCustomerData = reset_protected_customer_data($protectedCustomerIds, $skipped);
 

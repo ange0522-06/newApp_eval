@@ -11,6 +11,8 @@
  */
 export function getAllIds(resource: string): Promise<string[]>
 
+export function getFullResource(resource: string): Promise<Array<Record<string, string>>>
+
 /**
  * Récupère une ressource spécifique par son ID
  * @param resource - Nom de la ressource

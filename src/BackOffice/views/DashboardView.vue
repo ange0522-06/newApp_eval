@@ -3,7 +3,7 @@
     <div class="dashboard-header">
       <div>
         <h1>Tableau de bord</h1>
-        <p>Commandes par jour, montants et etats utilises.</p>
+        <p>Commandes payees ou livrees par jour, montants et etats utilises.</p>
       </div>
       <button class="btn-refresh" type="button" :disabled="isLoading" @click="loadStats">
         {{ isLoading ? 'Actualisation...' : 'Actualiser' }}
@@ -16,7 +16,7 @@
     <template v-if="stats">
       <section class="summary-grid">
         <article class="summary-card">
-          <span>Commandes</span>
+          <span>Payees / livrees</span>
           <strong>{{ stats.totalOrders }}</strong>
         </article>
         <article class="summary-card">

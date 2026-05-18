@@ -15,6 +15,22 @@ function debugLog(...args) {
   if (DEBUG_API) console.log(...args);
 }
 
+function singularResourceName(resource) {
+  return resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+}
+
+function readResourceNode(node) {
+  const result = {
+    id: node.getAttribute('id') || node.querySelector(':scope > id')?.textContent?.trim() || ''
+  };
+
+  Array.from(node.children).forEach(child => {
+    result[child.tagName] = child.textContent?.trim() || '';
+  });
+
+  return result;
+}
+
 const NON_WRITABLE_FIELDS_BY_RESOURCE = {
   products: [
     'id_default_image',
@@ -99,7 +115,7 @@ export async function getAllIds(resource) {
     }
 
     // Récupérer le nom singulier de la ressource (products -> product, stock_availables -> stock_available)
-    const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+    const singular = singularResourceName(resource);
     debugLog(`🔍 Cherche éléments singuliers: "${singular}"`);
     
     // Chercher tous les éléments enfants directs avec le nom singulier
@@ -110,6 +126,45 @@ export async function getAllIds(resource) {
     return ids;
   } catch (error) {
     console.error(`❌ Erreur getAllIds(${resource}):`, error);
+    throw error;
+  }
+}
+
+/**
+ * Recupere une ressource complete avec display=full en un seul appel.
+ * Utile pour eviter le schema lent getAllIds() puis getOne() sur chaque ID.
+ */
+export async function getFullResource(resource) {
+  try {
+    const response = await fetch(`${BASE_URL}/${resource}?display=full`, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'text/xml'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const xmlText = await response.text();
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+
+    if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
+      console.error(`Erreur de parsing XML pour ${resource}:`, xmlDoc);
+      return [];
+    }
+
+    const singular = singularResourceName(resource);
+    const container = xmlDoc.querySelector(resource);
+    const nodes = container
+      ? Array.from(container.children).filter(child => child.tagName === singular)
+      : Array.from(xmlDoc.querySelectorAll(singular));
+
+    return nodes.map(readResourceNode).filter(item => item.id);
+  } catch (error) {
+    console.error(`Erreur getFullResource(${resource}):`, error);
     throw error;
   }
 }
@@ -138,7 +193,7 @@ export async function getOne(resource, id) {
     const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
 
     // Récupérer le nom singulier de la ressource
-    const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+    const singular = singularResourceName(resource);
     
     // Chercher l'élément de ressource
     let resourceElement = xmlDoc.querySelector(singular);

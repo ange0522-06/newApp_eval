@@ -69,6 +69,48 @@ function ps_api_base_url(): string
     return rtrim($base, '/');
 }
 
+function ps_database_config(): array
+{
+    $config = require __DIR__ . '/../../eval/app/config/parameters.php';
+    $params = $config['parameters'] ?? [];
+
+    return [
+        'host' => (string) ($params['database_host'] ?? '127.0.0.1'),
+        'port' => (string) ($params['database_port'] ?? ''),
+        'name' => (string) ($params['database_name'] ?? ''),
+        'user' => (string) ($params['database_user'] ?? 'root'),
+        'password' => (string) ($params['database_password'] ?? ''),
+        'prefix' => (string) ($params['database_prefix'] ?? 'ps_'),
+    ];
+}
+
+function ps_pdo(): PDO
+{
+    static $pdo = null;
+    if ($pdo instanceof PDO) {
+        return $pdo;
+    }
+
+    $db = ps_database_config();
+    $dsn = 'mysql:host=' . $db['host']
+        . ($db['port'] !== '' ? ';port=' . $db['port'] : '')
+        . ';dbname=' . $db['name']
+        . ';charset=utf8mb4';
+
+    $pdo = new PDO($dsn, $db['user'], $db['password'], [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+
+    return $pdo;
+}
+
+function ps_db_prefix(): string
+{
+    return ps_database_config()['prefix'];
+}
+
 function ps_build_url(string $path, array $query = []): string
 {
     $query['ws_key'] = ps_api_key();

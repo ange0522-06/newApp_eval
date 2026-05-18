@@ -61,12 +61,12 @@
               <div class="action-buttons">
                 <!-- Échec supprimé — on gère seulement Payée et Annulé pour correspondre à PrestaShop simplifié -->
                 <button
-                  @click="changeOrderState(order, '2')"
-                  :disabled="order.current_state === '2' || isUpdating[order.id]"
+                  @click="changeOrderState(order, '5')"
+                  :disabled="order.current_state === '5' || isUpdating[order.id]"
                   class="btn btn-primary"
-                  title="Marquer comme paiement effectué"
+                  title="Marquer comme livree"
                 >
-                  ✅ Payée
+                  ✅ Livree
                 </button>
                 <button
                   @click="changeOrderState(order, '6')"
@@ -141,6 +141,8 @@ function formatPrice(priceStr: string, conversionRateStr?: string): string {
       return 'info'; // Paiement a la livraison
     case '2':
       return 'success'; // Paiement effectué → vert
+    case '5':
+      return 'success'; // Livree
     case '6':
       return 'cancel'; // Annulé → gris
     default:
@@ -193,6 +195,7 @@ async function changeOrderState(order: Order, newStateId: string): Promise<void>
       const stateNameMap: { [key: string]: string } = {
         '13': 'Paiement a la livraison',
         '2': 'Paiement effectué',
+        '5': 'Livr\u00e9',
         '6': 'Annulé',
         '8': 'Échec paiement',
       };

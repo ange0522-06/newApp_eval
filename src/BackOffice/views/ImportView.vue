@@ -59,7 +59,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue';
-import { parseCSV, detectFileType, getExpectedHeaders } from '../utils/csvParser';
+import { parseCSV, detectFileType, getExpectedHeaders, validateImportRows } from '../utils/csvParser';
 import {
   extractImagesFromZip,
   importProduits,
@@ -174,7 +174,10 @@ function parseTypedCsv(file: File, expectedType: 'produits' | 'declinaisons' | '
       );
     }
 
-    return { headers, rows: data.slice(1) };
+    const rows = data.slice(1);
+    validateImportRows(expectedType, headers, rows);
+
+    return { headers, rows };
   });
 }
 

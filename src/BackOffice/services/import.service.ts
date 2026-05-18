@@ -1,4 +1,4 @@
-import {
+﻿import {
   getAllIds,
   getOne,
   getOneXml,
@@ -21,9 +21,13 @@ const ID_SHOP_GROUP = 1;
 const ID_LANG = 1;
 const ID_CURRENCY = 1;
 const FALLBACK_ACTIVE_COUNTRY_ID = '8';
-const DEFAULT_CUSTOMER_GROUP = 3;
+const DEFAULT_CUSTOMER_GROUP = 1;
 const DEFAULT_EMPLOYEE = 1;
 const INITIAL_ORDER_STATE = '1';
+// ✅ États de commande selon PrestaShop et le PDF
+const ORDER_STATE_PAID = '2';           // "Paiement effectué"
+const ORDER_STATE_DELIVERED = '5';     // "Livré" (état standard PrestaShop)
+const ORDER_STATE_CANCELLED = '6';     // "Annulé"
 
 type CreatedResponse = { success?: boolean; id?: string | number; error?: string };
 type ImagePayload = { name: string; mime: string; base64: string };
@@ -53,6 +57,7 @@ const stockAvailableByProductKey = new Map<string, string>();
 const combinationIdByProductAndValueId = new Map<string, string>();
 const combinationIdByProductAndReference = new Map<string, string>();
 const productWithDefaultCombination = new Set<string>();
+const productsMarkedAsCombinations = new Set<string>();
 const productOptionInflight = new Map<string, Promise<string>>();
 const productOptionValueInflight = new Map<string, Promise<string>>();
 const customerInflight = new Map<string, Promise<{ id: string; secureKey: string }>>();
@@ -67,6 +72,7 @@ function resetImportCaches(): void {
   combinationIdByProductAndValueId.clear();
   combinationIdByProductAndReference.clear();
   productWithDefaultCombination.clear();
+  productsMarkedAsCombinations.clear();
   productOptionInflight.clear();
   productOptionValueInflight.clear();
   customerInflight.clear();
@@ -77,6 +83,10 @@ function resetImportCaches(): void {
 
 function normalize(value: string): string {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+function isPaidLikeOrderState(stateId: string): boolean {
+  return stateId === ORDER_STATE_PAID || stateId === ORDER_STATE_DELIVERED;
 }
 
 function xml(value: string | number): string {
@@ -152,36 +162,29 @@ async function processInBatches<T>(
 ): Promise<void> {
   for (let start = 0; start < items.length; start += batchSize) {
     const batch = items.slice(start, start + batchSize);
-    const concurrentPromises: Promise<void>[] = [];
+    let nextBatchIndex = 0;
+    let firstError: unknown = null;
 
-    for (let i = 0; i < batch.length; i++) {
-      const itemIndex = start + i;
-      const promise = handler(batch[i], itemIndex)
-        .catch(error => {
+    async function worker(): Promise<void> {
+      while (firstError === null && nextBatchIndex < batch.length) {
+        const localIndex = nextBatchIndex;
+        nextBatchIndex += 1;
+        const itemIndex = start + localIndex;
+
+        try {
+          await handler(batch[localIndex], itemIndex);
+        } catch (error) {
           console.error(`Erreur item ${itemIndex}:`, error);
-          throw error;
-        });
-
-      concurrentPromises.push(promise);
-
-      // ✅ Si on atteint maxConcurrency, attendre qu'une se termine
-      if (concurrentPromises.length >= maxConcurrency) {
-        await Promise.race(concurrentPromises)
-          .then(() => {
-            const idx = concurrentPromises.findIndex(p => p === promise);
-            if (idx !== -1) concurrentPromises.splice(idx, 1);
-          })
-          .catch((error) => {
-            console.error('Erreur Promise.race:', error);
-            throw error;
-          });
+          if (firstError === null) firstError = error;
+        }
       }
     }
 
-    // ✅ Attendre toutes les promesses restantes du lot
-    if (concurrentPromises.length > 0) {
-      await Promise.all(concurrentPromises);
-    }
+    await Promise.all(
+      Array.from({ length: Math.min(maxConcurrency, batch.length) }, () => worker())
+    );
+
+    if (firstError !== null) throw firstError;
   }
 }
 
@@ -438,6 +441,8 @@ function removeNotWritableFields(doc: Document): void {
 }
 
 async function updateProductTypeToCombinations(productId: string, transaction: ImportTransaction): Promise<void> {
+  if (productsMarkedAsCombinations.has(productId)) return;
+
   console.log(`  🔄 Changement du produit ${productId} en mode "combinations"...`);
   
   // 1. Récupérer le XML complet du produit
@@ -478,6 +483,7 @@ async function updateProductTypeToCombinations(productId: string, transaction: I
   console.log(`  ✓ Produit ${productId} maintenant en mode "combinations"`);
   
   // Tracker le changement pour rollback
+  productsMarkedAsCombinations.add(productId);
   transaction.trackUpdate('fichier2', 'products', productId, previousWritableXml);
 }
 
@@ -547,27 +553,16 @@ async function findStockAvailableId(productId: string, combinationId = '0'): Pro
     const match = stockAvailableByProductKey.get(stockKey(productId, combinationId));
     if (match) return match;
   } catch (error) {
-    console.warn('Chargement global de stock_availables impossible, fallback sur la recherche id par id.', error);
+    console.warn('Chargement global de stock_availables impossible, fallback sur création. Raison:', error);
+    // ✅ Si le chargement global échoue, ne pas essayer le fallback ID par ID (trop d'erreurs 404)
+    // Laisser updateStock() créer le stock directement
+    return null;
   }
 
-  const ids = await getAllIds('stock_availables');
-  for (const id of ids) {
-    try {
-      const stockXml = await getOneXml('stock_availables', id, { silent404: true });
-      if (!stockXml) continue;
-      const stockDoc = new DOMParser().parseFromString(stockXml, 'text/xml');
-      const stock = {
-        id_product: stockDoc.querySelector('id_product')?.textContent?.trim() || '',
-        id_product_attribute: stockDoc.querySelector('id_product_attribute')?.textContent?.trim() || '0',
-      };
-      if (stock.id_product === productId && String(stock.id_product_attribute || '0') === String(combinationId)) {
-        stockAvailableByProductKey.set(stockKey(productId, combinationId), id);
-        return id;
-      }
-    } catch (error) {
-      console.warn(`Stock introuvable ou inaccessible pour stock_availables/${id}, on ignore.`, error);
-    }
-  }
+  const match = stockAvailableByProductKey.get(stockKey(productId, combinationId));
+  if (match) return match;
+  
+  // ✅ Si pas trouvé en cache, retourner null plutôt que de faire des GET 404s
   return null;
 }
 
@@ -599,6 +594,11 @@ async function updateStock(
     );
     transaction.trackResource(step, 'stock_availables', stockId);
     stockAvailableByProductKey.set(stockKey(productId, combinationId), stockId);
+    cacheResource('stock_availables', stockId, {
+      id_product: productId,
+      id_product_attribute: combinationId,
+      quantity: String(quantity),
+    });
     return;
   }
 
@@ -1218,12 +1218,111 @@ async function createCombinationWithRecovery(params: {
   throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${firstResult.error || 'HTTP 500'})`);
 }
 
+// ✅ Interface pour collecter les mises à jour de stock (batch à la fin)
+interface StockUpdateBatch {
+  productId: string;
+  combinationId: string;
+  quantity: number;
+  skipIfAlreadyExists: boolean;
+}
+
+// ✅ Traiter une seule déclinaison (prêt pour la parallélisation)
+async function processSingleDeclinaison(
+  row: string[],
+  rowNumber: number,
+  headers: string[],
+  transaction: ImportTransaction,
+  defaultCombinationCreatedByProduct: Set<string>,
+  stockUpdates: StockUpdateBatch[]
+): Promise<void> {
+  const reference = getColumnValue(headers, row, 'reference');
+  const specificite = getColumnValue(headers, row, 'specificite');
+  const karazany = getColumnValue(headers, row, 'karazany');
+  const stockInitial = parseInt(getColumnValue(headers, row, 'stock_initial'), 10);
+  const priceTTCValue = getColumnValue(headers, row, 'prix_vente_ttc');
+
+  if (!reference || Number.isNaN(stockInitial)) {
+    throw new Error(`Fichier 2 ligne ${rowNumber}: reference et stock_initial sont requis`);
+  }
+
+  const product = productsByReference.get(normalize(reference));
+  if (!product) throw new Error(`Fichier 2 ligne ${rowNumber}: produit ${reference} absent du fichier 1`);
+
+  if (!specificite && !karazany) {
+    stockUpdates.push({
+      productId: product.id,
+      combinationId: '0',
+      quantity: stockInitial,
+      skipIfAlreadyExists: false,
+    });
+    return;
+  }
+
+  if (!specificite || !karazany) {
+    throw new Error(`Fichier 2 ligne ${rowNumber}: specificite et karazany doivent etre remplis ensemble`);
+  }
+
+  // ✅ updateProductTypeToCombinations a un cache, pas de redondance même en parallèle
+  const groupId = await ensureProductOption(specificite, transaction);
+  const valueId = await ensureProductOptionValue(groupId, karazany, transaction);
+  const priceTTC = priceTTCValue ? parseNumber(priceTTCValue) : product.priceTTC;
+  const priceImpactHT = (priceTTC - product.priceTTC) / (1 + product.taxRate);
+
+  const combinationReference = `${reference}-${karazany}`;
+  let combinationId = await findCombination(product.id, valueId, combinationReference);
+  let createdCombination = false;
+
+  if (!combinationId) {
+    const isDefault = !defaultCombinationCreatedByProduct.has(product.id)
+      && !(await productHasDefaultCombination(product.id));
+
+    await validateCombinationBeforePost(product.id, valueId, combinationReference, rowNumber);
+
+    const created = await createCombinationWithRecovery({
+      productId: product.id,
+      reference: combinationReference,
+      priceImpactHT,
+      valueId,
+      isDefault,
+    });
+    combinationId = created.id;
+
+    if (created.created) transaction.trackResource('fichier2', 'combinations', combinationId);
+    combinationIdByProductAndValueId.set(combinationValueKey(product.id, valueId), combinationId);
+    combinationIdByProductAndReference.set(combinationReferenceKey(product.id, combinationReference), combinationId);
+    stockAvailableCacheLoaded = false;
+    combinationCacheLoaded = false;
+    createdCombination = created.created;
+  }
+
+  defaultCombinationCreatedByProduct.add(product.id);
+
+  // ✅ Collecter pour batch à la fin au lieu d'appeler immédiatement
+  stockUpdates.push({
+    productId: product.id,
+    combinationId,
+    quantity: stockInitial,
+    skipIfAlreadyExists: !createdCombination,
+  });
+
+  combinationsByReferenceAndValue.set(combinationKey(reference, karazany), {
+    id: combinationId,
+    productId: product.id,
+    reference,
+    karazany,
+    priceHT: product.priceHT + priceImpactHT,
+    priceTTC,
+  });
+}
+
 export async function importDeclinaisons(
   rows: string[][],
   headers: string[],
   transaction: ImportTransaction
 ): Promise<void> {
   transaction.registerStep('fichier2');
+  const startTime = performance.now();
+  
   await cleanupInvalidSpecificPriceRules();
   await Promise.all([
     loadFullResource('product_options'),
@@ -1231,17 +1330,17 @@ export async function importDeclinaisons(
   ]);
 
   const defaultCombinationCreatedByProduct = new Set<string>();
-
-  // Important: on traite les déclinaisons une par une.
-  // Cela évite les conflits PrestaShop sur product_type, default_on et stock_available.
+  const stockUpdates: StockUpdateBatch[] = [];
+  
+  // ✅ ÉTAPE 1: Identifier les produits qui ont besoin d'être mis à jour en mode "combinations"
+  const productsToUpdateType = new Set<string>();
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
     const rowNumber = index + 2;
     const reference = getColumnValue(headers, row, 'reference');
-    const specificite = getColumnValue(headers, row, 'specificité');
+    const specificite = getColumnValue(headers, row, 'specificite');
     const karazany = getColumnValue(headers, row, 'karazany');
     const stockInitial = parseInt(getColumnValue(headers, row, 'stock_initial'), 10);
-    const priceTTCValue = getColumnValue(headers, row, 'prix_vente_ttc');
 
     if (!reference || Number.isNaN(stockInitial)) {
       throw new Error(`Fichier 2 ligne ${rowNumber}: reference et stock_initial sont requis`);
@@ -1250,76 +1349,66 @@ export async function importDeclinaisons(
     const product = productsByReference.get(normalize(reference));
     if (!product) throw new Error(`Fichier 2 ligne ${rowNumber}: produit ${reference} absent du fichier 1`);
 
-    if (!specificite && !karazany) {
-      await updateStock(transaction, 'fichier2', product.id, '0', stockInitial);
-      continue;
+    if (specificite && karazany) {
+      productsToUpdateType.add(product.id);
     }
-
-    if (!specificite || !karazany) {
-      throw new Error(`Fichier 2 ligne ${rowNumber}: specificite et karazany doivent etre remplis ensemble`);
-    }
-
-    // Le produit doit être en mode "combinations" AVANT le POST /api/combinations.
-    // Cette fonction fait un GET complet, un PUT avec vérification, et attend.
-    await updateProductTypeToCombinations(product.id, transaction);
-
-    const groupId = await ensureProductOption(specificite, transaction);
-    const valueId = await ensureProductOptionValue(groupId, karazany, transaction);
-    const priceTTC = priceTTCValue ? parseNumber(priceTTCValue) : product.priceTTC;
-    const priceImpactHT = (priceTTC - product.priceTTC) / (1 + product.taxRate);
-
-    const combinationReference = `${reference}-${karazany}`;
-    let combinationId = await findCombination(product.id, valueId, combinationReference);
-    let createdCombination = false;
-
-    if (!combinationId) {
-      const isDefault = !defaultCombinationCreatedByProduct.has(product.id)
-        && !(await productHasDefaultCombination(product.id));
-
-      // Validation diagnostique AVANT le POST combinaison
-      await validateCombinationBeforePost(product.id, valueId, combinationReference, rowNumber);
-
-      const combinationXml = buildCombinationXml({
-        productId: product.id,
-        reference: combinationReference,
-        priceImpactHT,
-        valueId,
-        isDefault,
-      });
-
-      console.log(`  📤 POST combinaison: produit=${product.id}, valeur=${valueId}, reference=${combinationReference}, isDefault=${isDefault}`);
-      console.log(`     XML: ${combinationXml.substring(0, 200)}...`);
-
-      const created = await createCombinationWithRecovery({
-        productId: product.id,
-        reference: combinationReference,
-        priceImpactHT,
-        valueId,
-        isDefault,
-      });
-      combinationId = created.id;
-
-      if (created.created) transaction.trackResource('fichier2', 'combinations', combinationId);
-      combinationIdByProductAndValueId.set(combinationValueKey(product.id, valueId), combinationId);
-      combinationIdByProductAndReference.set(combinationReferenceKey(product.id, combinationReference), combinationId);
-      stockAvailableCacheLoaded = false;
-      combinationCacheLoaded = false;
-      createdCombination = created.created;
-    }
-
-    defaultCombinationCreatedByProduct.add(product.id);
-
-    await updateStock(transaction, 'fichier2', product.id, combinationId, stockInitial, !createdCombination);
-    combinationsByReferenceAndValue.set(combinationKey(reference, karazany), {
-      id: combinationId,
-      productId: product.id,
-      reference,
-      karazany,
-      priceHT: product.priceHT + priceImpactHT,
-      priceTTC,
-    });
   }
 
+  // ✅ ÉTAPE 2: Mettre à jour le type pour TOUS les produits en parallèle (ne se fait qu'une fois grâce au cache)
+  if (productsToUpdateType.size > 0) {
+    console.log(`⚡ Changement du type pour ${productsToUpdateType.size} produits en parallèle...`);
+    await Promise.all(
+      Array.from(productsToUpdateType).map(productId =>
+        updateProductTypeToCombinations(productId, transaction)
+      )
+    );
+    console.log(`✅ Type changé avec succès`);
+  }
+
+  // ✅ ÉTAPE 3: Traiter les déclinaisons en ordre stable pour ne créer
+  // qu'une seule déclinaison par défaut par produit.
+  console.log(`⚡ Traitement de ${rows.length} déclinaisons en ordre stable...`);
+  const rowsWithIndex = rows.map((row, index) => ({ row, index }));
+  
+  await processInBatches(
+    rowsWithIndex,
+    100, // batch size
+    async (item) => {
+      await processSingleDeclinaison(
+        item.row,
+        item.index + 2,
+        headers,
+        transaction,
+        defaultCombinationCreatedByProduct,
+        stockUpdates
+      );
+    },
+    1
+  );
+
+  // ✅ ÉTAPE 4: Appliquer toutes les mises à jour de stock en batch
+  if (stockUpdates.length > 0) {
+    console.log(`⚡ Application de ${stockUpdates.length} mises à jour de stock en batch (max 5 concurrent)...`);
+    await processInBatches(
+      stockUpdates,
+      50,
+      async (update) => {
+        await updateStock(
+          transaction,
+          'fichier2',
+          update.productId,
+          update.combinationId,
+          update.quantity,
+          update.skipIfAlreadyExists
+        );
+      },
+      5
+    );
+  }
+
+  const endTime = performance.now();
+  console.log(`✅ Fichier 2 traité en ${((endTime - startTime) / 1000).toFixed(2)}s`);
+  
   transaction.markStepSuccess('fichier2');
 }
 
@@ -1408,6 +1497,110 @@ function resolveCartItem(item: { reference: string; quantite: number; karazany: 
   };
 }
 
+function resolveImportOrderState(rawState: string, rowNumber: number): string | null {
+  const state = normalize(rawState);
+  if (!state) return null;
+  
+  if (state === 'paiement accepte' || state === 'paiement effectue') {
+    return ORDER_STATE_PAID;
+  }
+  if (state === 'livre') return ORDER_STATE_DELIVERED;
+  if (state === 'annule') return ORDER_STATE_CANCELLED;
+
+  throw new Error(
+    `Fichier 3 ligne ${rowNumber}: etat invalide "${rawState}". ` +
+    'Valeurs acceptees: vide, paiement accepte, paiement effectue, livre, annule'
+  );
+}
+
+async function createOrderPayment(
+  orderId: string,
+  totalPaid: string,
+  date: string,
+  transaction: ImportTransaction
+): Promise<void> {
+  const orderData = (await getOne('orders', orderId)) as unknown as Record<string, string>;
+  const reference = orderData.reference || '';
+  if (!reference) return;
+
+  const paymentId = await postRequired(
+    'order_payments',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <order_payment>
+    <order_reference>${cdata(reference)}</order_reference>
+    <id_currency>${ID_CURRENCY}</id_currency>
+    <amount>${totalPaid}</amount>
+    <payment><![CDATA[Cash on delivery]]></payment>
+    <conversion_rate>1.000000</conversion_rate>
+    <date_add>${date}</date_add>
+  </order_payment>
+</prestashop>`,
+    `Paiement commande ${orderId}`
+  );
+  transaction.trackResource('fichier3', 'order_payments', paymentId);
+}
+
+async function readStockQuantity(productId: string, combinationId: string): Promise<number> {
+  const stockId = await findStockAvailableId(productId, combinationId);
+  if (!stockId) return 0;
+
+  const cached = getCachedResource('stock_availables', stockId);
+  let quantity = Number(cached?.quantity ?? NaN);
+  if (!Number.isFinite(quantity)) {
+    const stockXml = (await getOneXml('stock_availables', stockId)) as string;
+    const stockDoc = new DOMParser().parseFromString(stockXml, 'text/xml');
+    quantity = Number(stockDoc.querySelector('quantity')?.textContent?.trim() || '0');
+  }
+
+  return Number.isFinite(quantity) ? quantity : 0;
+}
+
+async function validateOrderStockBeforeImport(rows: string[][], headers: string[]): Promise<void> {
+  const simulatedStock = new Map<string, number>();
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const rowNumber = index + 2;
+    const items = parseAchat(getColumnValue(headers, rows[index], 'achat'));
+    const orderStateId = resolveImportOrderState(getColumnValue(headers, rows[index], 'etat'), rowNumber);
+
+    if (orderStateId === null) {
+      continue;
+    }
+
+    const resolved = items.map(resolveCartItem);
+    const touched: Array<{ key: string; quantity: number }> = [];
+
+    for (let itemIndex = 0; itemIndex < resolved.length; itemIndex += 1) {
+      const entry = resolved[itemIndex];
+      const item = items[itemIndex];
+      const key = stockKey(entry.product.id, entry.combinationId);
+
+      if (!simulatedStock.has(key)) {
+        simulatedStock.set(key, await readStockQuantity(entry.product.id, entry.combinationId));
+      }
+
+      const currentQuantity = simulatedStock.get(key) ?? 0;
+      const nextQuantity = currentQuantity - item.quantite;
+      if (nextQuantity < 0) {
+        throw new Error(
+          `Fichier 3 ligne ${rowNumber}: stock insuffisant pour ${item.reference}/${item.karazany || 'simple'} ` +
+          `(stock disponible avant commande: ${currentQuantity}, quantite demandee: ${item.quantite})`
+        );
+      }
+
+      simulatedStock.set(key, nextQuantity);
+      touched.push({ key, quantity: item.quantite });
+    }
+
+    if (orderStateId === ORDER_STATE_CANCELLED) {
+      for (const movement of touched) {
+        simulatedStock.set(movement.key, (simulatedStock.get(movement.key) ?? 0) + movement.quantity);
+      }
+    }
+  }
+}
+
 export async function importCommandes(
   rows: string[][],
   headers: string[],
@@ -1422,21 +1615,20 @@ export async function importCommandes(
     loadFullResource('customers'),
     loadFullResource('carriers'),
     loadFullResource('countries'),
-  ]);
+    loadFullResource('stock_availables'), // ✅ CRITIQUE: recharger les stocks du fichier 2
+  ]).catch(err => {
+    // Si stock_availables échoue, ce n'est pas bloquant - updateStock() les créera
+    console.warn('⚠️ Préchargement des stocks échoué (non critique):', err);
+  });
   console.log(`✓ Préchargement fichier3 terminé en ${Math.round(performance.now() - startPreload)}ms`);
-
-  const orderStateMap: Record<string, string> = {
-    'en attente paiement a la livraison': '13',
-    'paiement accepte': '2',
-    'paiement effectue': '2',
-    'annule': '6',
-    'annulee': '6',
-    'erreur de paiement': '8',
-    'dans le panier': '', // Empty state = cart only, no order
-  };
+  
+  // ✅ Track des ordres créées pour corriger les dates après
+  const ordersToFixDates: Array<{ id: string; date: string }> = [];
 
   const carrierId = await getDefaultCarrierId();
   const countryId = await getDefaultCountryId();
+
+  await validateOrderStockBeforeImport(rows, headers);
 
   await processInBatches(rows, 4, async (row, index) => {
     const rowNumber = index + 2;
@@ -1447,7 +1639,7 @@ export async function importCommandes(
     const address = getColumnValue(headers, row, 'adresse');
     const items = parseAchat(getColumnValue(headers, row, 'achat'));
     const stateRaw = getColumnValue(headers, row, 'etat');
-    const stateKey = normalize(stateRaw);
+    const orderStateId = resolveImportOrderState(stateRaw, rowNumber);
 
     if (!name || !email || !password || !address || items.length === 0) {
       throw new Error(`Fichier 3 ligne ${rowNumber}: nom, email, pwd, adresse et achat sont requis`);
@@ -1516,13 +1708,10 @@ export async function importCommandes(
     transaction.trackResource('fichier3', 'carts', cartId);
 
     // Check if state indicates cart-only (no order)
-    const isCartOnly = !stateRaw.trim() || stateKey === 'dans le panier';
+    const isCartOnly = orderStateId === null;
     if (isCartOnly) {
       return;
     }
-
-    const orderStateId = orderStateMap[stateKey];
-    if (!orderStateId) throw new Error(`Fichier 3 ligne ${rowNumber}: etat inconnu "${stateRaw}"`);
 
     const totalHT = resolved.reduce((sum, entry, index) => sum + entry.unitHT * items[index].quantite, 0);
     const totalTTC = resolved.reduce((sum, entry, index) => sum + entry.unitTTC * items[index].quantite, 0);
@@ -1588,10 +1777,12 @@ export async function importCommandes(
       `Commande ${email}`
     );
     transaction.trackResource('fichier3', 'orders', orderId);
+    
+    // ✅ Tracker l'ordre pour corriger la date après (PrestaShop ignore les dates via l'API)
+    ordersToFixDates.push({ id: orderId, date });
 
-    if (orderStateId !== INITIAL_ORDER_STATE) {
-      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'current_state', orderStateId, false);
-      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'valid', orderStateId === '2' ? 1 : 0, false);
+    if (isPaidLikeOrderState(orderStateId)) {
+      await createOrderPayment(orderId, totalPaid, date, transaction);
     }
 
     const historyId = await postRequired(
@@ -1608,7 +1799,43 @@ export async function importCommandes(
       `Historique commande ${orderId}`
     );
     transaction.trackResource('fichier3', 'order_histories', historyId);
-  });
+  }, 1);
+
+  // ✅ Corriger les dates des ordres (PrestaShop les ignore via l'API)
+  if (ordersToFixDates.length > 0) {
+    console.log(`⚡ Correction des dates pour ${ordersToFixDates.length} commandes...`);
+    console.log('📋 Ordres à corriger:', ordersToFixDates);
+    try {
+      const payload = JSON.stringify({ orders: ordersToFixDates });
+      console.log('📤 Envoi à /newapp-api/fix-order-dates.php:', payload.substring(0, 200) + '...');
+      
+      const response = await fetch('/newapp-api/fix-order-dates.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+      });
+      
+      console.log(`📥 Réponse statut: ${response.status}`);
+      const text = await response.text();
+      console.log('📥 Réponse brute:', text.substring(0, 500));
+      
+      let result: any;
+      try {
+        result = JSON.parse(text);
+      } catch (parseError) {
+        throw new Error(`Impossible de parser la réponse JSON: ${text}`);
+      }
+      
+      if (result.success) {
+        console.log(`✅ Dates corrigées avec succès pour ${result.fixed} commandes`);
+      } else {
+        console.warn(`⚠️ Correction partielle des dates: ${result.fixed} réussis, ${result.failed} échoués`, result.errors);
+      }
+    } catch (error) {
+      console.error('❌ Erreur lors de la correction des dates:', error);
+      throw error; // Re-throw pour que la transaction le capture
+    }
+  }
 
   transaction.markStepSuccess('fichier3');
 }

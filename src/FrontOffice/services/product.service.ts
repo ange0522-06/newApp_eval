@@ -1,4 +1,4 @@
-import { getAllIds, getOneXml } from '@/shared/services/prestashop.service.js'
+import { getAllIds, getFullResource, getOneXml } from '@/shared/services/prestashop.service.js'
 import type { Product, ProductDetail, Combination, Attribute, Category } from '@/FrontOffice/types/product.types'
 
 // ─── Helpers XML ─────────────────────────────────────────────────────────────
@@ -71,19 +71,17 @@ async function getTaxRate(idTaxRulesGroup: string): Promise<number> {
   }
 
   try {
-    const taxRuleIds = await getAllIds('tax_rules')
-    for (const id of taxRuleIds) {
-      const ruleXml: string = await getOneXml('tax_rules', id)
-      const ruleDoc = parseXML(ruleXml)
-      const groupId = getText(ruleDoc, 'id_tax_rules_group')
+    const taxRules = await getFullResource('tax_rules')
+    const taxes = await getFullResource('taxes')
+    for (const rule of taxRules as any[]) {
+      const groupId = rule.id_tax_rules_group || ''
 
       if (groupId === idTaxRulesGroup) {
-        const idTax = getText(ruleDoc, 'id_tax')
+        const idTax = rule.id_tax || ''
         if (!idTax || idTax === '0') return 0
 
-        const taxXml: string = await getOneXml('taxes', idTax)
-        const taxDoc = parseXML(taxXml)
-        const rate = parseFloat(getText(taxDoc, 'rate'))
+        const tax = (taxes as any[]).find((entry) => entry.id === idTax)
+        const rate = parseFloat(tax?.rate || '0')
         const result = isNaN(rate) ? 0 : rate / 100
 
         // Sauvegarder dans le cache pour les prochains produits
@@ -146,18 +144,14 @@ let stockCacheLoaded = false
 async function preloadStocks(): Promise<void> {
   if (stockCacheLoaded) return
   try {
-    const ids = await getAllIds('stock_availables')
-    await Promise.allSettled(
-      ids.map(async (id) => {
-        const xml: string = await getOneXml('stock_availables', id)
-        const doc = parseXML(xml)
-        const pid = getText(doc, 'id_product')
-        const cid = getText(doc, 'id_product_attribute')
-        const qty = parseInt(getText(doc, 'quantity')) || 0
+    const stocks = await getFullResource('stock_availables')
+    for (const stock of stocks as any[]) {
+        const pid = stock.id_product || ''
+        const cid = stock.id_product_attribute || '0'
+        const qty = parseInt(stock.quantity || '0') || 0
         // Clé unique = productId_combinationId
         stockCache.set(`${pid}_${cid}`, qty)
-      })
-    )
+    }
     stockCacheLoaded = true
   } catch {
     stockCacheLoaded = false
@@ -349,15 +343,14 @@ function labelDuplicateCategoryNames(categories: Category[]): Category[] {
 
 export async function getAllCategories(): Promise<Category[]> {
   try {
-    const ids = await getAllIds('categories')
+    const rows = await getFullResource('categories')
     const categories: Category[] = []
 
-    for (const id of ids) {
+    for (const category of rows as any[]) {
       try {
-        const xml = await getOneXml('categories', id) as string
-        const doc = parseXML(xml)
-        const name = getLangText(doc, 'name')
-        const idParent = getText(doc, 'id_parent')
+        const id = category.id || ''
+        const name = category.name || ''
+        const idParent = category.id_parent || ''
         
         // Exclure la catégorie racine (id=1) et accueil (id=2)
         if (id !== '1' && id !== '2') {

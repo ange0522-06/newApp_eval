@@ -1,4 +1,4 @@
-import { getAllIds, getOne } from '@/shared/services/prestashop.service.js'
+import { getFullResource } from '@/shared/services/prestashop.service.js'
 import { getAllOrders, type Order } from './orders.service'
 
 export type DashboardDayRow = {
@@ -25,9 +25,12 @@ export type DashboardStats = {
 const STATE_LABELS: Record<string, string> = {
   cart: 'Dans le panier',
   '13': 'Paiement a la livraison',
-  '2': 'Paiement effectue',
+  '2': 'Paiement accepte',
+  '5': 'Livre',
   '6': 'Annule',
 }
+
+const DASHBOARD_ORDER_STATES = new Set(['2', '5'])
 
 function toAmount(order: Order): number {
   const total = parseFloat(order.total_paid || '0') || 0
@@ -42,18 +45,13 @@ function toDay(dateValue: string): string {
 
 async function countPendingCarts(orderCartIds: Set<string>): Promise<number> {
   try {
-    const cartIds = await getAllIds('carts')
+    const carts = await getFullResource('carts')
     let count = 0
 
-    for (const cartId of cartIds) {
+    for (const cart of carts as any[]) {
+      const cartId = cart.id || ''
       if (orderCartIds.has(cartId)) continue
-
-      try {
-        const cart = await getOne('carts', cartId) as any
-        if (cart?.id_customer) count += 1
-      } catch {
-        continue
-      }
+      if (cart?.id_customer) count += 1
     }
 
     return count
@@ -78,11 +76,12 @@ export async function getDashboardStats(): Promise<DashboardStats> {
   const loadStartTime = performance.now();
 
   const orders = await getAllOrders()
+  const payableOrders = orders.filter(order => DASHBOARD_ORDER_STATES.has(order.current_state))
   const dayMap = new Map<string, DashboardDayRow>()
   const stateMap = new Map<string, DashboardStateRow>()
   const orderCartIds = new Set(orders.map(order => order.id_cart).filter(Boolean))
 
-  for (const order of orders) {
+  for (const order of payableOrders) {
     const amount = toAmount(order)
     const day = toDay(order.date_add)
     const dayRow = dayMap.get(day) || { date: day, count: 0, amount: 0 }
@@ -115,8 +114,8 @@ export async function getDashboardStats(): Promise<DashboardStats> {
   const result: DashboardStats = {
     days: Array.from(dayMap.values()).sort((a, b) => b.date.localeCompare(a.date)),
     states: Array.from(stateMap.values()).sort((a, b) => a.label.localeCompare(b.label)),
-    totalOrders: orders.length,
-    totalAmount: orders.reduce((sum, order) => sum + toAmount(order), 0),
+    totalOrders: payableOrders.length,
+    totalAmount: payableOrders.reduce((sum, order) => sum + toAmount(order), 0),
     pendingCarts,
   };
 
