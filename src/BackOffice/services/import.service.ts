@@ -4,6 +4,7 @@ import {
   getOneXml,
   postXML,
   putXML,
+  deleteResource,
   uploadProductImage,
 } from '../../shared/services/prestashop.service.js';
 import { API_CONFIG } from '../config/config';
@@ -50,6 +51,8 @@ const resourceFullCache = new Map<string, Map<string, Record<string, string>>>()
 const resourceFullInflight = new Map<string, Promise<Map<string, Record<string, string>>>>();
 const stockAvailableByProductKey = new Map<string, string>();
 const combinationIdByProductAndValueId = new Map<string, string>();
+const combinationIdByProductAndReference = new Map<string, string>();
+const productWithDefaultCombination = new Set<string>();
 const productOptionInflight = new Map<string, Promise<string>>();
 const productOptionValueInflight = new Map<string, Promise<string>>();
 const customerInflight = new Map<string, Promise<{ id: string; secureKey: string }>>();
@@ -62,6 +65,8 @@ function resetImportCaches(): void {
   resourceFullInflight.clear();
   stockAvailableByProductKey.clear();
   combinationIdByProductAndValueId.clear();
+  combinationIdByProductAndReference.clear();
+  productWithDefaultCombination.clear();
   productOptionInflight.clear();
   productOptionValueInflight.clear();
   customerInflight.clear();
@@ -221,6 +226,10 @@ function combinationValueKey(productId: string, attributeValueId: string): strin
   return `${productId}::${attributeValueId}`;
 }
 
+function combinationReferenceKey(productId: string, reference: string): string {
+  return `${productId}::${normalize(reference)}`;
+}
+
 async function postRequired(resource: string, body: string, label: string): Promise<string> {
   const result = (await postXML(resource, body)) as unknown as CreatedResponse;
   return getCreatedId(result, label);
@@ -366,7 +375,67 @@ function setFirstTag(doc: Document, tagName: string, value: string | number): vo
 }
 
 function removeNotWritableFields(doc: Document): void {
+  // Supprimer les champs non modifiables PrestaShop
+  // Basé sur les attributs notFilterable="true" mais aussi liste explicite
+  const nonWritableFields = [
+    'id', 'date_add', 'date_upd', 'views', 'rating', 'indexed',
+    'position_in_category', 'similarity', 'cache', 'status'
+  ];
+  
   doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
+  nonWritableFields.forEach((fieldName) => {
+    const elements = doc.getElementsByTagName(fieldName);
+    // Garder le premier pour les champs qui peuvent être enfants (comme <id>)
+    // mais supprimer les duplicatas et les champs de métadonnées
+    if (fieldName === 'id') return; // <id> est nécessaire pour PUT
+    while (elements.length > 1) {
+      elements[elements.length - 1].remove();
+    }
+  });
+}
+
+async function updateProductTypeToCombinations(productId: string, transaction: ImportTransaction): Promise<void> {
+  console.log(`  🔄 Changement du produit ${productId} en mode "combinations"...`);
+  
+  // 1. Récupérer le XML complet du produit
+  const productXml = (await getOneXml('products', productId)) as string;
+  const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+  
+  // 2. Nettoyer les champs non modifiables
+  removeNotWritableFields(doc);
+  const previousWritableXml = new XMLSerializer().serializeToString(doc);
+  
+  // 3. Changer product_type en "combinations"
+  setFirstTag(doc, 'product_type', 'combinations');
+  
+  // 4. Envoyer le PUT
+  const nextXml = new XMLSerializer().serializeToString(doc);
+  const ok = await putXML('products', productId, nextXml);
+  
+  if (!ok) {
+    throw new Error(`Impossible de changer le type du produit ${productId} en "combinations". Vérifier les logs PrestaShop.`);
+  }
+  
+  // 5. CRITIQUE: Attendre un peu et vérifier que le changement a vraiment pris effet
+  await wait(300);
+  
+  // 6. Recharger le produit et vérifier que product_type est bien "combinations"
+  const verifyXml = (await getOneXml('products', productId)) as string;
+  const verifyDoc = new DOMParser().parseFromString(verifyXml, 'text/xml');
+  const productType = verifyDoc.querySelector('product_type')?.textContent?.trim();
+  
+  if (productType !== 'combinations') {
+    throw new Error(
+      `ERREUR CRITIQUE: Le produit ${productId} n'est pas passé en mode "combinations". ` +
+      `Type actuel: "${productType}". PrestaShop a possiblement rejeté le changement. ` +
+      `Vérifier les logs: eval/var/logs/dev.log ou eval/var/logs/prod.log`
+    );
+  }
+  
+  console.log(`  ✓ Produit ${productId} maintenant en mode "combinations"`);
+  
+  // Tracker le changement pour rollback
+  transaction.trackUpdate('fichier2', 'products', productId, previousWritableXml);
 }
 
 async function updateResourceField(
@@ -607,44 +676,68 @@ function combinationKey(reference: string, karazany: string): string {
   return `${normalize(reference)}::${normalize(karazany)}`;
 }
 
-async function findCombination(productId: string, attributeValueId: string): Promise<string | null> {
-  const cacheKey = combinationValueKey(productId, attributeValueId);
-  const cached = combinationIdByProductAndValueId.get(cacheKey);
-  if (cached) return cached;
-
+async function loadCombinationCache(force = false): Promise<void> {
+  if (combinationCacheLoaded && !force) return;
   if (!combinationCacheLoaded) {
-    try {
-      const response = await fetch(`${API_CONFIG.BASE_URL}/combinations?display=full`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'text/xml' },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const xmlText = await response.text();
-      const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-      const nodes = Array.from(doc.querySelectorAll('combinations > combination, prestashop > combination, combination'));
-      for (const node of nodes) {
-        const combinationId = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
-        const idProduct = node.querySelector('id_product')?.textContent?.trim() || '';
-        const values = Array.from(node.querySelectorAll('associations product_option_values product_option_value id'))
-          .map((valueNode) => valueNode.textContent?.trim())
-          .filter((value): value is string => Boolean(value));
-        for (const valueId of values) {
-          if (combinationId && idProduct) {
-            combinationIdByProductAndValueId.set(combinationValueKey(idProduct, valueId), combinationId);
-          }
-        }
-      }
-      combinationCacheLoaded = true;
-    } catch (error) {
-      console.warn('Chargement global des declinaisons impossible, fallback sur la recherche id par id.', error);
-    }
+    force = true;
   }
 
-  const loaded = combinationIdByProductAndValueId.get(cacheKey);
+  try {
+    const response = await fetch(`${API_CONFIG.BASE_URL}/combinations?display=full`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'text/xml' },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    if (force) {
+      combinationIdByProductAndValueId.clear();
+      combinationIdByProductAndReference.clear();
+      productWithDefaultCombination.clear();
+    }
+
+    const xmlText = await response.text();
+    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+    const nodes = Array.from(doc.querySelectorAll('combinations > combination, prestashop > combination, combination'));
+    for (const node of nodes) {
+      const combinationId = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
+      const idProduct = node.querySelector('id_product')?.textContent?.trim() || '';
+      const reference = node.querySelector('reference')?.textContent?.trim() || '';
+      const defaultOn = node.querySelector('default_on')?.textContent?.trim() || '';
+      if (combinationId && idProduct && reference) {
+        combinationIdByProductAndReference.set(combinationReferenceKey(idProduct, reference), combinationId);
+      }
+      if (combinationId && idProduct && defaultOn === '1') {
+        productWithDefaultCombination.add(idProduct);
+      }
+      const values = Array.from(node.querySelectorAll('associations product_option_values product_option_value id'))
+        .map((valueNode) => valueNode.textContent?.trim())
+        .filter((value): value is string => Boolean(value));
+      for (const valueId of values) {
+        if (combinationId && idProduct) {
+          combinationIdByProductAndValueId.set(combinationValueKey(idProduct, valueId), combinationId);
+        }
+      }
+    }
+    combinationCacheLoaded = true;
+  } catch (error) {
+    console.warn('Chargement global des declinaisons impossible, fallback sur la recherche id par id.', error);
+  }
+}
+
+async function findCombination(productId: string, attributeValueId: string, reference?: string): Promise<string | null> {
+  const cacheKey = combinationValueKey(productId, attributeValueId);
+  const referenceKey = reference ? combinationReferenceKey(productId, reference) : '';
+  const cached = combinationIdByProductAndValueId.get(cacheKey)
+    || (referenceKey ? combinationIdByProductAndReference.get(referenceKey) : null);
+  if (cached) return cached;
+
+  await loadCombinationCache();
+
+  const loaded = combinationIdByProductAndValueId.get(cacheKey)
+    || (referenceKey ? combinationIdByProductAndReference.get(referenceKey) : null);
   if (loaded) return loaded;
 
   const ids = await getAllIds('combinations');
@@ -652,14 +745,67 @@ async function findCombination(productId: string, attributeValueId: string): Pro
     const xmlText = (await getOneXml('combinations', id)) as string;
     const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
     const idProduct = doc.querySelector('id_product')?.textContent?.trim();
+    const apiReference = doc.querySelector('reference')?.textContent?.trim() || '';
+    const defaultOn = doc.querySelector('default_on')?.textContent?.trim() || '';
     const values = Array.from(doc.querySelectorAll('associations product_option_values product_option_value id'))
       .map((node) => node.textContent?.trim());
-    if (idProduct === productId && values.includes(attributeValueId)) {
+    if (idProduct === productId && defaultOn === '1') productWithDefaultCombination.add(productId);
+    if (idProduct === productId && apiReference) {
+      combinationIdByProductAndReference.set(combinationReferenceKey(productId, apiReference), id);
+    }
+    if (idProduct === productId && (values.includes(attributeValueId) || (reference && normalize(apiReference) === normalize(reference)))) {
       combinationIdByProductAndValueId.set(cacheKey, id);
       return id;
     }
   }
   return null;
+}
+
+async function productHasDefaultCombination(productId: string): Promise<boolean> {
+  if (productWithDefaultCombination.has(productId)) return true;
+  await loadCombinationCache();
+  return productWithDefaultCombination.has(productId);
+}
+
+function hasInvalidSpecificPriceRule(data: Record<string, string>): boolean {
+  const reductionType = normalize(data.reduction_type || '');
+  const fromQuantity = Number(data.from_quantity || '0');
+
+  return !['amount', 'percentage'].includes(reductionType)
+    || !Number.isFinite(fromQuantity)
+    || fromQuantity < 1
+    || String(data.price ?? '').trim() === '';
+}
+
+async function cleanupInvalidSpecificPriceRules(): Promise<void> {
+  const rules = await loadFullResource('specific_price_rules');
+  const invalidRules = Array.from(rules)
+    .filter(([, data]) => hasInvalidSpecificPriceRule(data));
+
+  if (invalidRules.length === 0) return;
+
+  console.warn(
+    `Suppression de ${invalidRules.length} regle(s) de prix specifique invalide(s) ` +
+    'qui bloquaient la creation des declinaisons.',
+    invalidRules.map(([id, data]) => ({
+      id,
+      name: data.name || '',
+      price: data.price || '',
+      from_quantity: data.from_quantity || '',
+      reduction_type: data.reduction_type || '',
+    }))
+  );
+
+  for (const [id] of invalidRules) {
+    const ok = await deleteResource('specific_price_rules', id);
+    if (!ok) {
+      throw new Error(
+        `Regle de prix specifique invalide ${id} impossible a supprimer. ` +
+        'Elle provoque un crash PrestaShop pendant la creation des declinaisons.'
+      );
+    }
+    rules.delete(id);
+  }
 }
 
 export async function extractImagesFromZip(zipFile: File): Promise<Record<string, ImagePayload>> {
@@ -866,21 +1012,185 @@ export async function importImages(
   transaction.markStepSuccess('images');
 }
 
+async function validateCombinationBeforePost(
+  productId: string,
+  valueId: string,
+  reference: string,
+  rowNumber: number
+): Promise<void> {
+  // Vérifier que productId existe et est un nombre
+  if (!productId || !/^\d+$/.test(String(productId))) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: ID produit invalide "${productId}". ` +
+      `Vérifier que le produit a été créé au fichier 1.`
+    );
+  }
+
+  // Vérifier que valueId existe et est un nombre
+  if (!valueId || !/^\d+$/.test(String(valueId))) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: ID attribut invalide "${valueId}". ` +
+      `Vérifier que la valeur d'attribut a été créée correctement.`
+    );
+  }
+
+  // Vérifier que la référence n'est pas vide
+  if (!reference || !reference.trim()) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: référence vide pour combinaison. ` +
+      `Format attendu: REFERENCE-karazany`
+    );
+  }
+
+  // Vérifier que le produit existe et est en mode "combinations"
+  try {
+    const productXml = (await getOneXml('products', productId, { silent404: true })) as string | null;
+    if (!productXml) {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: produit ${productId} introuvable. ` +
+        `Vérifier que le produit a été créé au fichier 1 et importé correctement.`
+      );
+    }
+
+    const productDoc = new DOMParser().parseFromString(productXml, 'text/xml');
+    const productType = productDoc.querySelector('product_type')?.textContent?.trim();
+    
+    // CRITIQUE: le produit DOIT être en mode "combinations"
+    if (productType !== 'combinations') {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: ERREUR CRITIQUE - Produit ${productId} n'est PAS en mode "combinations". ` +
+        `Type actuel: "${productType}". ` +
+        `La tentative de changement de type a possiblement échoué. ` +
+        `Vérifier eval/var/logs/dev.log ou eval/var/logs/prod.log`
+      );
+    }
+    
+    console.log(`  ✓ Produit ${productId} est en mode "combinations"`);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('ERREUR CRITIQUE')) {
+      throw error; // Relancer l'erreur critique
+    }
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: impossible de vérifier le produit ${productId}. ` +
+      `Détails: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  // Vérifier que valueId existe dans product_option_values
+  try {
+    const valueXml = (await getOneXml('product_option_values', valueId, { silent404: true })) as string | null;
+    if (!valueXml) {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: valeur d'attribut ${valueId} introuvable. ` +
+        `Vérifier que la valeur a été créée correctement au fichier 2.`
+      );
+    }
+    console.log(`  ✓ Valeur d'attribut ${valueId} existe`);
+  } catch (error) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: impossible de vérifier la valeur d'attribut ${valueId}. ` +
+      `Détails: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  console.log(`  ✓ Validation OK pour combinaison ${reference}`);
+}
+
+function buildCombinationXml(params: {
+  productId: string;
+  reference: string;
+  priceImpactHT: number;
+  valueId: string;
+  isDefault: boolean;
+}): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop xmlns:xlink="http://www.w3.org/1999/xlink">
+  <combination>
+    <id_product>${params.productId}</id_product>
+    <reference>${cdata(params.reference)}</reference>
+    <price>${params.priceImpactHT.toFixed(6)}</price>
+    <minimal_quantity>1</minimal_quantity>
+    <default_on>${params.isDefault ? 1 : 0}</default_on>
+    <associations>
+      <product_option_values>
+        <product_option_value>
+          <id>${params.valueId}</id>
+        </product_option_value>
+      </product_option_values>
+    </associations>
+  </combination>
+</prestashop>`;
+}
+
+async function createCombinationWithRecovery(params: {
+  productId: string;
+  reference: string;
+  priceImpactHT: number;
+  valueId: string;
+  isDefault: boolean;
+}): Promise<{ id: string; created: boolean }> {
+  const existingBefore = await findCombination(params.productId, params.valueId, params.reference);
+  if (existingBefore) return { id: existingBefore, created: false };
+
+  const firstXml = buildCombinationXml(params);
+  const firstResult = (await postXML('combinations', firstXml)) as unknown as CreatedResponse;
+  if (firstResult.success && firstResult.id) {
+    const id = String(firstResult.id);
+    combinationIdByProductAndValueId.set(combinationValueKey(params.productId, params.valueId), id);
+    combinationIdByProductAndReference.set(combinationReferenceKey(params.productId, params.reference), id);
+    if (params.isDefault) productWithDefaultCombination.add(params.productId);
+    return { id, created: true };
+  }
+
+  // PrestaShop peut insérer la combinaison puis crasher avant de répondre.
+  // On recharge donc le cache avant de considérer la création comme échouée.
+  await wait(300);
+  await loadCombinationCache(true);
+  const existingAfterCrash = await findCombination(params.productId, params.valueId, params.reference);
+  if (existingAfterCrash) return { id: existingAfterCrash, created: false };
+
+  if (params.isDefault) {
+    const retryXml = buildCombinationXml({ ...params, isDefault: false });
+    const retryResult = (await postXML('combinations', retryXml)) as unknown as CreatedResponse;
+    if (retryResult.success && retryResult.id) {
+      const id = String(retryResult.id);
+      combinationIdByProductAndValueId.set(combinationValueKey(params.productId, params.valueId), id);
+      combinationIdByProductAndReference.set(combinationReferenceKey(params.productId, params.reference), id);
+      return { id, created: true };
+    }
+
+    await wait(300);
+    await loadCombinationCache(true);
+    const existingAfterRetry = await findCombination(params.productId, params.valueId, params.reference);
+    if (existingAfterRetry) return { id: existingAfterRetry, created: false };
+
+    throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${retryResult.error || firstResult.error || 'HTTP 500'})`);
+  }
+
+  throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${firstResult.error || 'HTTP 500'})`);
+}
+
 export async function importDeclinaisons(
   rows: string[][],
   headers: string[],
   transaction: ImportTransaction
 ): Promise<void> {
   transaction.registerStep('fichier2');
+  await cleanupInvalidSpecificPriceRules();
   await Promise.all([
     loadFullResource('product_options'),
     loadFullResource('product_option_values'),
   ]);
 
-  await processInBatches(rows, 4, async (row, index) => {
+  const defaultCombinationCreatedByProduct = new Set<string>();
+
+  // Important: on traite les déclinaisons une par une.
+  // Cela évite les conflits PrestaShop sur product_type, default_on et stock_available.
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
     const rowNumber = index + 2;
     const reference = getColumnValue(headers, row, 'reference');
-    const specificite = getColumnValue(headers, row, 'specificite');
+    const specificite = getColumnValue(headers, row, 'specificité');
     const karazany = getColumnValue(headers, row, 'karazany');
     const stockInitial = parseInt(getColumnValue(headers, row, 'stock_initial'), 10);
     const priceTTCValue = getColumnValue(headers, row, 'prix_vente_ttc');
@@ -894,45 +1204,62 @@ export async function importDeclinaisons(
 
     if (!specificite && !karazany) {
       await updateStock(transaction, 'fichier2', product.id, '0', stockInitial);
-      return;
+      continue;
     }
 
     if (!specificite || !karazany) {
       throw new Error(`Fichier 2 ligne ${rowNumber}: specificite et karazany doivent etre remplis ensemble`);
     }
 
+    // Le produit doit être en mode "combinations" AVANT le POST /api/combinations.
+    // Cette fonction fait un GET complet, un PUT avec vérification, et attend.
+    await updateProductTypeToCombinations(product.id, transaction);
+
     const groupId = await ensureProductOption(specificite, transaction);
     const valueId = await ensureProductOptionValue(groupId, karazany, transaction);
     const priceTTC = priceTTCValue ? parseNumber(priceTTCValue) : product.priceTTC;
     const priceImpactHT = (priceTTC - product.priceTTC) / (1 + product.taxRate);
 
-    let combinationId = await findCombination(product.id, valueId);
+    const combinationReference = `${reference}-${karazany}`;
+    let combinationId = await findCombination(product.id, valueId, combinationReference);
     let createdCombination = false;
+
     if (!combinationId) {
-      combinationId = await postRequired(
-        'combinations',
-        `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <combination>
-    <id_product>${product.id}</id_product>
-    <reference>${cdata(`${reference}-${karazany}`)}</reference>
-    <price>${priceImpactHT.toFixed(6)}</price>
-    <minimal_quantity>1</minimal_quantity>
-    <default_on>0</default_on>
-    <associations>
-      <product_option_values>
-        <product_option_value><id>${valueId}</id></product_option_value>
-      </product_option_values>
-    </associations>
-  </combination>
-</prestashop>`,
-        `Declinaison ${reference}/${karazany}`
-      );
-      transaction.trackResource('fichier2', 'combinations', combinationId);
+      const isDefault = !defaultCombinationCreatedByProduct.has(product.id)
+        && !(await productHasDefaultCombination(product.id));
+
+      // Validation diagnostique AVANT le POST combinaison
+      await validateCombinationBeforePost(product.id, valueId, combinationReference, rowNumber);
+
+      const combinationXml = buildCombinationXml({
+        productId: product.id,
+        reference: combinationReference,
+        priceImpactHT,
+        valueId,
+        isDefault,
+      });
+
+      console.log(`  📤 POST combinaison: produit=${product.id}, valeur=${valueId}, reference=${combinationReference}, isDefault=${isDefault}`);
+      console.log(`     XML: ${combinationXml.substring(0, 200)}...`);
+
+      const created = await createCombinationWithRecovery({
+        productId: product.id,
+        reference: combinationReference,
+        priceImpactHT,
+        valueId,
+        isDefault,
+      });
+      combinationId = created.id;
+
+      if (created.created) transaction.trackResource('fichier2', 'combinations', combinationId);
       combinationIdByProductAndValueId.set(combinationValueKey(product.id, valueId), combinationId);
+      combinationIdByProductAndReference.set(combinationReferenceKey(product.id, combinationReference), combinationId);
       stockAvailableCacheLoaded = false;
-      createdCombination = true;
+      combinationCacheLoaded = false;
+      createdCombination = created.created;
     }
+
+    defaultCombinationCreatedByProduct.add(product.id);
 
     await updateStock(transaction, 'fichier2', product.id, combinationId, stockInitial, !createdCombination);
     combinationsByReferenceAndValue.set(combinationKey(reference, karazany), {
@@ -943,7 +1270,7 @@ export async function importDeclinaisons(
       priceHT: product.priceHT + priceImpactHT,
       priceTTC,
     });
-  });
+  }
 
   transaction.markStepSuccess('fichier2');
 }

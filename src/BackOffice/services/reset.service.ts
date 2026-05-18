@@ -94,7 +94,7 @@ export async function resetAll(): Promise<ResetResult> {
     failedCount: data.failedCount || 0,
     message: data.message || 'Reset termine avec succes',
     details: {
-      deleted: data.details?.deleted || [],
+      deleted: normalizeDeleted(data.details),
       skipped: data.details?.skipped || [],
       failed: data.details?.failed || [],
     },

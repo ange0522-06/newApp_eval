@@ -10,7 +10,7 @@
       <h2>Import transactionnel</h2>
       <p class="description">
         Selectionnez les 3 fichiers CSV et images.zip, puis lancez l'import. Si une etape echoue,
-        les ressources deja creees sont supprimees, puis un reset complet nettoie les restes eventuels.
+        seules les ressources creees pendant cet import sont supprimees ou restaurees.
       </p>
 
       <div class="file-grid">
@@ -59,7 +59,7 @@
 
 <script setup lang="ts">
 import { ref } from 'vue';
-import { parseCSV, detectFileType } from '../utils/csvParser';
+import { parseCSV, detectFileType, getExpectedHeaders } from '../utils/csvParser';
 import {
   extractImagesFromZip,
   importProduits,
@@ -68,7 +68,6 @@ import {
   importCommandes,
 } from '../services/import.service';
 import { ImportTransaction } from '../services/transactionManager';
-import { resetAll } from '../services/reset.service';
 
 const file1 = ref<File | null>(null);
 const file2 = ref<File | null>(null);
@@ -97,8 +96,8 @@ interface ImportStepUi {
 const initialImportSteps: ImportStepUi[] = [
   { key: 'validation', label: 'Verification des 4 fichiers', status: 'waiting', detail: '' },
   { key: 'fichier1', label: 'Fichier 1 - Produits', status: 'waiting', detail: '' },
-  { key: 'images', label: 'Fichier 4 - Images', status: 'waiting', detail: '' },
   { key: 'fichier2', label: 'Fichier 2 - Declinaisons / stock', status: 'waiting', detail: '' },
+  { key: 'images', label: 'Fichier 4 - Images', status: 'waiting', detail: '' },
   { key: 'fichier3', label: 'Fichier 3 - Clients / paniers / commandes', status: 'waiting', detail: '' },
   { key: 'rollback', label: 'Annulation transactionnelle', status: 'waiting', detail: '' },
 ];
@@ -169,7 +168,10 @@ function parseTypedCsv(file: File, expectedType: 'produits' | 'declinaisons' | '
     const headers = data[0];
     const detected = detectFileType(headers);
     if (detected !== expectedType) {
-      throw new Error(`${file.name}: format invalide (${detected})`);
+      throw new Error(
+        `${file.name}: format invalide (${detected}). ` +
+        `Colonnes attendues exactement: ${getExpectedHeaders(expectedType).join(', ')}`
+      );
     }
 
     return { headers, rows: data.slice(1) };
@@ -232,6 +234,11 @@ async function importAll(): Promise<void> {
     await importProduits(csv1.rows, csv1.headers, transaction);
     setStepStatus('fichier1', 'success', `${csv1.rows.length} ligne(s) traitee(s).`);
 
+    currentStep = 'fichier2';
+    setStepStatus('fichier2', 'running', 'Import des declinaisons et stocks en cours.');
+    await importDeclinaisons(csv2.rows, csv2.headers, transaction);
+    setStepStatus('fichier2', 'success', `${csv2.rows.length} ligne(s) traitee(s).`);
+
     currentStep = 'images';
     if (zipFile.value && Object.keys(images).length > 0) {
       setStepStatus('images', 'running', 'Import des images produits en cours.');
@@ -240,11 +247,6 @@ async function importAll(): Promise<void> {
     } else {
       setStepStatus('images', 'success', 'Pas d\'images a importer (ZIP non fourni ou vide).');
     }
-
-    currentStep = 'fichier2';
-    setStepStatus('fichier2', 'running', 'Import des declinaisons et stocks en cours.');
-    await importDeclinaisons(csv2.rows, csv2.headers, transaction);
-    setStepStatus('fichier2', 'success', `${csv2.rows.length} ligne(s) traitee(s).`);
 
     currentStep = 'fichier3';
     setStepStatus('fichier3', 'running', 'Import des clients, paniers et commandes en cours.');
@@ -268,35 +270,17 @@ async function importAll(): Promise<void> {
       ? failedStep
       : currentStep) as ImportStepKey;
 
-    const shouldRunReset = currentStep !== 'validation' || status.totalResourcesCreated > 0;
     setStepStatus(failedStepKey, 'failed', message);
     setStepStatus('rollback', 'running', 'Erreur detectee: annulation de tout ce qui a deja ete importe.');
     if (failedStep === currentStep && !status.steps.some((step) => step.name === failedStep)) {
       transaction.registerStep(failedStep);
     }
     await transaction.markStepFailed(failedStep, message);
-    let cleanupMessage = 'Rollback termine.';
-    let cleanupError = '';
-    if (shouldRunReset) {
-      setStepStatus('rollback', 'running', 'Rollback API termine. Reset complet des donnees importees en cours.');
-      try {
-        const resetResult = await resetAll();
-        cleanupMessage = `${cleanupMessage} ${resetResult.message}`;
-      } catch (resetError) {
-        cleanupError = resetError instanceof Error ? resetError.message : String(resetError);
-      }
-    }
     markImportedStepsRolledBack();
-    if (cleanupError) {
-      setStepStatus('rollback', 'failed', `Rollback API tente, mais le reset complet a echoue: ${cleanupError}`);
-    } else {
-      setStepStatus('rollback', 'success', `${cleanupMessage} Les 4 fichiers ne sont pas valides partiellement.`);
-    }
+    setStepStatus('rollback', 'success', 'Rollback termine. Aucun reset complet lance.');
     transaction.logReport();
     const failedLabel = importSteps.value.find((step) => step.key === failedStepKey)?.label || failedStepKey;
-    globalMessage.value = cleanupError
-      ? `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Le nettoyage automatique a echoue, lancez le reset manuellement. Details: ${message}. Reset: ${cleanupError}`
-      : `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Aucun import partiel n'a ete conserve. Details: ${message}`;
+    globalMessage.value = `Import echoue apres ${formatDuration(importStartTime)}: erreur dans ${failedLabel}. Rollback effectue sans reset complet. Details: ${message}`;
     globalMessageStatus.value = 'error';
   } finally {
     isImportingAll.value = false;

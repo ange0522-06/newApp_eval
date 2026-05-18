@@ -27,6 +27,8 @@ export function getOne(resource: string, id: string): Promise<string>
  */
 export function getOneXml(resource: string, id: string, options?: { silent404?: boolean }): Promise<string | null>
 
+export function sanitizeXmlForPut(resource: string, xmlBody: string): string
+
 /**
  * Crée une nouvelle ressource via POST
  * @param resource - Nom de la ressource

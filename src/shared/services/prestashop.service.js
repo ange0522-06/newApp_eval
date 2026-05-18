@@ -15,6 +15,43 @@ function debugLog(...args) {
   if (DEBUG_API) console.log(...args);
 }
 
+const NON_WRITABLE_FIELDS_BY_RESOURCE = {
+  products: [
+    'id_default_image',
+    'id_default_combination',
+    'manufacturer_name',
+    'position_in_category',
+    'quantity',
+    'type'
+  ],
+};
+
+/**
+ * Nettoie un XML provenant d'un GET avant de le renvoyer en PUT.
+ * PrestaShop renvoie certains champs calcules/non modifiables; si on les
+ * renvoie tels quels, le WebService refuse le PUT et le rollback echoue.
+ */
+export function sanitizeXmlForPut(resource, xmlBody) {
+  if (!xmlBody || typeof xmlBody !== 'string') return xmlBody;
+
+  try {
+    const doc = new DOMParser().parseFromString(xmlBody, 'text/xml');
+    if (doc.getElementsByTagName('parsererror').length > 0) return xmlBody;
+
+    doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
+
+    const fields = NON_WRITABLE_FIELDS_BY_RESOURCE[resource] || [];
+    for (const field of fields) {
+      Array.from(doc.getElementsByTagName(field)).forEach((element) => element.remove());
+    }
+
+    return new XMLSerializer().serializeToString(doc);
+  } catch (error) {
+    console.warn(`Nettoyage XML PUT impossible pour ${resource}, XML envoye tel quel.`, error);
+    return xmlBody;
+  }
+}
+
 /**
  * Récupère tous les IDs d'une ressource
  * @param {string} resource - Nom de la ressource (products, customers, orders, stock_availables, etc.)
@@ -181,12 +218,13 @@ export async function getOneXml(resource, id, options = {}) {
  */
 export async function putXML(resource, id, xmlBody) {
   try {
+    const body = sanitizeXmlForPut(resource, xmlBody);
     const response = await fetch(`${BASE_URL}/${resource}/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'text/xml'
       },
-      body: xmlBody
+      body
     });
 
     if (!response.ok) {
@@ -194,7 +232,7 @@ export async function putXML(resource, id, xmlBody) {
       
       // Log the XML we sent for easier debugging (similar to postXML)
       try {
-        console.error(`📋 XML envoyé (PUT ${resource}/${id}):\n${xmlBody}`);
+        console.error(`📋 XML envoyé (PUT ${resource}/${id}):\n${body}`);
       } catch (e) {
         // ignore logging errors
       }
@@ -356,6 +394,30 @@ export async function postXML(resource, xmlBody) {
       console.error(`❌ POST échoué pour ${resource}:`, errorMsg);
       console.error(`📋 XML envoyé (COMPLET):\n${xmlBody}`);
       console.error(`📨 Réponse serveur (${errorText.length} chars):\n${errorText || '(VIDE)'}`);
+      
+      // Si HTTP 500 avec réponse vide, donner des instructions claires
+      if (response.status >= 500 && (!errorText || errorText.trim() === '')) {
+        const debugMsg = [
+          `\n⚠️  ERREUR SERVEUR AVEC RÉPONSE VIDE (HTTP ${response.status})`,
+          `\nRessource: ${resource}`,
+          `URL: ${BASE_URL}/${resource}`,
+          `XML envoyé:\n${xmlBody}`,
+          `\n🔧 DIAGNOSTIC:`,
+          `1. Vérifier les logs PrestaShop:`,
+          `   - eval/var/logs/dev.log`,
+          `   - eval/var/logs/prod.log`,
+          `2. Vérifier les logs Apache:`,
+          `   - xampp/apache/logs/error.log`,
+          `3. Possibles causes:`,
+          `   - Erreur PHP ou SQL dans PrestaShop`,
+          `   - Données invalides ou doubloon d'identifiant`,
+          `   - Attributs XML non reconnus ou mal formés`,
+          `   - Permissions insuffisantes sur la ressource`,
+          `\nConsulter les logs mentionnés ci-dessus pour plus de détails.`
+        ].join('\n');
+        console.error(debugMsg);
+      }
+      
       return { success: false, error: errorMsg };
     }
 

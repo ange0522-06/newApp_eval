@@ -1,14 +1,52 @@
 /**
- * Utilitaires pour parser les fichiers CSV
+ * Utilitaires pour parser les fichiers CSV.
  */
 
+type ImportFileType = 'produits' | 'declinaisons' | 'commandes';
+
+const EXPECTED_HEADERS: Record<ImportFileType, string[]> = {
+  produits: [
+    'date_availability_produit',
+    'nom',
+    'reference',
+    'prix_ttc',
+    'Taxe',
+    'categorie',
+    'prix_achat',
+  ],
+  declinaisons: [
+    'reference',
+    'specificité',
+    'karazany',
+    'stock_initial',
+    'prix_vente_ttc',
+  ],
+  commandes: [
+    'date',
+    'nom',
+    'email',
+    'pwd',
+    'adresse',
+    'achat',
+    'etat',
+  ],
+};
+
+function cleanHeader(header: string): string {
+  return header.replace(/^\uFEFF/, '').trim();
+}
+
+function hasExactHeaders(headers: string[], expected: string[]): boolean {
+  const cleaned = headers.map(cleanHeader);
+  return expected.every((header) => cleaned.includes(header));
+}
+
 /**
- * Parse un contenu CSV en tableau de tableaux
- * Supporte séparateurs : virgule, point-virgule, tab
- * Gère les valeurs entre guillemets
+ * Parse un contenu CSV en tableau de tableaux.
+ * Supporte separateurs : virgule, point-virgule, tab.
+ * Gere les valeurs entre guillemets.
  */
 export function parseCSV(content: string): string[][] {
-  // Auto-détection du séparateur
   const firstLine = content.split('\n')[0] || '';
   let delimiter = ',';
 
@@ -18,7 +56,6 @@ export function parseCSV(content: string): string[][] {
     delimiter = '\t';
   }
 
-  // Parser le CSV avec gestion des guillemets
   const lines = content.split('\n').filter((line) => line.trim());
   const result: string[][] = [];
 
@@ -33,15 +70,12 @@ export function parseCSV(content: string): string[][] {
 
       if (char === '"') {
         if (insideQuotes && nextChar === '"') {
-          // Guillemets échappés
           currentValue += '"';
-          i++; // Sauter le prochain guillemet
+          i++;
         } else {
-          // Toggle guillemets
           insideQuotes = !insideQuotes;
         }
       } else if (char === delimiter && !insideQuotes) {
-        // Fin de valeur
         row.push(currentValue.trim());
         currentValue = '';
       } else {
@@ -49,7 +83,6 @@ export function parseCSV(content: string): string[][] {
       }
     }
 
-    // Ajouter la dernière valeur
     if (currentValue || row.length > 0) {
       row.push(currentValue.trim());
     }
@@ -63,115 +96,77 @@ export function parseCSV(content: string): string[][] {
 }
 
 /**
- * Normalise les accents pour comparison
- */
-function normalizeAccents(str: string): string {
-  return str
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase();
-}
-
-/**
- * Détecte le type de fichier basé sur les en-têtes
- * Insensible à la casse ET aux accents
+ * Detecte le type de fichier avec des noms de colonnes stricts.
+ * La casse, les accents et les caracteres doivent correspondre exactement.
  */
 export function detectFileType(
   headers: string[]
-): 'produits' | 'declinaisons' | 'commandes' | 'inconnu' {
-  const headerNormalized = headers.map((h) => normalizeAccents(h));
-
-  // Fichier 1 : Produits
-  if (
-    headerNormalized.includes('nom') &&
-    headerNormalized.includes('reference') &&
-    headerNormalized.includes('prix_ttc') &&
-    headerNormalized.includes('taxe') &&
-    headerNormalized.includes('categorie')
-  ) {
-    return 'produits';
-  }
-
-  // Fichier 2 : Déclinaisons
-  if (
-    headerNormalized.includes('reference') &&
-    headerNormalized.includes('specificite') &&
-    headerNormalized.includes('karazany') &&
-    headerNormalized.includes('stock_initial')
-  ) {
-    return 'declinaisons';
-  }
-
-  // Fichier 3 : Commandes
-  if (
-    headerNormalized.includes('nom') &&
-    headerNormalized.includes('email') &&
-    headerNormalized.includes('pwd') &&
-    headerNormalized.includes('achat') &&
-    headerNormalized.includes('etat')
-  ) {
-    return 'commandes';
-  }
+): ImportFileType | 'inconnu' {
+  if (hasExactHeaders(headers, EXPECTED_HEADERS.produits)) return 'produits';
+  if (hasExactHeaders(headers, EXPECTED_HEADERS.declinaisons)) return 'declinaisons';
+  if (hasExactHeaders(headers, EXPECTED_HEADERS.commandes)) return 'commandes';
 
   return 'inconnu';
 }
 
+export function getExpectedHeaders(type: ImportFileType): string[] {
+  return [...EXPECTED_HEADERS[type]];
+}
+
 /**
- * Convertit une chaîne en nombre
- * Supporte format français : "12,5" → 12.5
- * Supporte pourcentages : "11,65%" → 0.1165
+ * Convertit une chaine en nombre.
+ * Supporte format francais : "12,5" -> 12.5.
+ * Supporte pourcentages : "11,65%" -> 0.1165.
  */
 export function parseNumber(value: string): number {
   if (!value) return 0;
 
-  // Enlever les espaces
   let normalized = value.trim();
 
-  // Gérer les pourcentages
   if (normalized.endsWith('%')) {
     normalized = normalized.slice(0, -1).trim();
-    // Convertir "11,65" → 11.65 puis 11.65 / 100 = 0.1165
     const numValue = parseFloat(normalized.replace(',', '.'));
     return numValue / 100;
   }
 
-  // Convertir virgule française en point
   normalized = normalized.replace(',', '.');
 
   return parseFloat(normalized) || 0;
 }
 
 /**
- * Convertit une date dd/mm/yyyy en format ISO yyyy-mm-dd HH:mm:ss
+ * Convertit une date d/m/yyyy ou dd/mm/yyyy en format ISO yyyy-mm-dd HH:mm:ss.
+ * Tout autre format est refuse.
  */
 export function parseDate(value: string): string {
   if (!value) {
-    return new Date().toISOString().replace('T', ' ').slice(0, 19);
+    throw new Error('Date vide: format attendu d/m/yyyy');
   }
 
-  try {
-    const parts = value.trim().split('/');
-    if (parts.length !== 3) {
-      return new Date().toISOString().replace('T', ' ').slice(0, 19);
-    }
-
-    const [day, month, year] = parts;
-    const date = new Date(`${year}-${month}-${day}`);
-
-    if (isNaN(date.getTime())) {
-      return new Date().toISOString().replace('T', ' ').slice(0, 19);
-    }
-
-    return date.toISOString().replace('T', ' ').slice(0, 19);
-  } catch (error) {
-    console.warn(`Erreur parsing date "${value}":`, error);
-    return new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const match = value.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) {
+    throw new Error(`Date invalide "${value}": format attendu d/m/yyyy`);
   }
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    throw new Error(`Date invalide "${value}": date inexistante`);
+  }
+
+  return date.toISOString().replace('T', ' ').slice(0, 19);
 }
 
 /**
- * Parse la colonne "achat" : [("REFERENCE";QUANTITE;"KARAZANY")]
- * Retourne tableau d'objets {reference, quantite, karazany}
+ * Parse la colonne "achat" : [("REFERENCE";QUANTITE;"KARAZANY")].
+ * Retourne tableau d'objets {reference, quantite, karazany}.
  */
 export function parseAchat(
   value: string
@@ -180,10 +175,7 @@ export function parseAchat(
     return [];
   }
 
-  const result: Array<{ reference: string; quantite: number; karazany: string }> =
-    [];
-
-  // Regex pour capturer : ("REFERENCE";QUANTITE;"KARAZANY")
+  const result: Array<{ reference: string; quantite: number; karazany: string }> = [];
   const regex = /\(\s*"([^"]+)"\s*;\s*(\d+)\s*;\s*"([^"]*)"\s*\)/g;
 
   let match;
@@ -199,19 +191,15 @@ export function parseAchat(
 }
 
 /**
- * Récupère l'index d'une colonne par son nom
- * Insensible à la casse ET aux accents
+ * Recupere l'index d'une colonne par son nom exact.
  */
 export function getColumnIndex(headers: string[], columnName: string): number {
-  const normalizedName = normalizeAccents(columnName);
-  const index = headers.findIndex(
-    (h) => normalizeAccents(h) === normalizedName
-  );
+  const index = headers.findIndex((header) => cleanHeader(header) === columnName);
   return index >= 0 ? index : -1;
 }
 
 /**
- * Récupère la valeur d'une colonne dans une ligne
+ * Recupere la valeur d'une colonne dans une ligne.
  */
 export function getColumnValue(headers: string[], row: string[], columnName: string): string {
   const index = getColumnIndex(headers, columnName);
