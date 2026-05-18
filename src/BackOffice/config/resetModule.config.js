@@ -6,7 +6,7 @@
 export const RESET_MODULE_CONFIG = {
   // Configuration API
   api: {
-    baseUrl: 'http://localhost/eval/api',
+    baseUrl: 'http://localhost/e-commerce/eval/api',
     contentType: 'text/xml',
     authMethod: 'Basic Auth',
     apiKeyEnvVar: 'VITE_PS_API_KEY'

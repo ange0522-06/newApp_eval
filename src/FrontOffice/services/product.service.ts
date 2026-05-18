@@ -1,4 +1,4 @@
-import { getAllIds, getOneXml } from '@/shared/services/prestashop.service.js'
+import { getAllIds, getFullResource, getOneXml } from '@/shared/services/prestashop.service.js'
 import type { Product, ProductDetail, Combination, Attribute, Category } from '@/FrontOffice/types/product.types'
 
 // ─── Helpers XML ─────────────────────────────────────────────────────────────
@@ -18,6 +18,29 @@ function getLangText(doc: Document | Element, selector: string, langId = '1'): s
 
 function getMainImageId(doc: Document | Element): string {
   return doc.querySelector('associations images image id')?.textContent?.trim() ?? ''
+}
+
+function normalizeProductDate(value: string): string {
+  if (!value || value.startsWith('0000-00-00')) return ''
+  return value
+}
+
+function getProductReleaseDate(doc: Document | Element): string {
+  return normalizeProductDate(getText(doc, 'available_date')) ||
+    normalizeProductDate(getText(doc, 'date_add'))
+}
+
+function getReleaseBadge(dateValue: string): 'HOT' | 'NEW' | undefined {
+  if (!dateValue) return undefined
+
+  const releaseDate = new Date(dateValue.replace(' ', 'T'))
+  if (Number.isNaN(releaseDate.getTime())) return undefined
+
+  const ageInDays = (Date.now() - releaseDate.getTime()) / (1000 * 60 * 60 * 24)
+  if (ageInDays < 0) return undefined
+  if (ageInDays <= 1) return 'HOT'
+  if (ageInDays <= 7) return 'NEW'
+  return undefined
 }
 
 // ─── Image ───────────────────────────────────────────────────────────────────
@@ -48,19 +71,17 @@ async function getTaxRate(idTaxRulesGroup: string): Promise<number> {
   }
 
   try {
-    const taxRuleIds = await getAllIds('tax_rules')
-    for (const id of taxRuleIds) {
-      const ruleXml: string = await getOneXml('tax_rules', id)
-      const ruleDoc = parseXML(ruleXml)
-      const groupId = getText(ruleDoc, 'id_tax_rules_group')
+    const taxRules = await getFullResource('tax_rules', '[id,id_tax_rules_group,id_tax]')
+    const taxes = await getFullResource('taxes', '[id,rate]')
+    for (const rule of taxRules as any[]) {
+      const groupId = rule.id_tax_rules_group || ''
 
       if (groupId === idTaxRulesGroup) {
-        const idTax = getText(ruleDoc, 'id_tax')
+        const idTax = rule.id_tax || ''
         if (!idTax || idTax === '0') return 0
 
-        const taxXml: string = await getOneXml('taxes', idTax)
-        const taxDoc = parseXML(taxXml)
-        const rate = parseFloat(getText(taxDoc, 'rate'))
+        const tax = (taxes as any[]).find((entry) => entry.id === idTax)
+        const rate = parseFloat(tax?.rate || '0')
         const result = isNaN(rate) ? 0 : rate / 100
 
         // Sauvegarder dans le cache pour les prochains produits
@@ -123,18 +144,14 @@ let stockCacheLoaded = false
 async function preloadStocks(): Promise<void> {
   if (stockCacheLoaded) return
   try {
-    const ids = await getAllIds('stock_availables')
-    await Promise.allSettled(
-      ids.map(async (id) => {
-        const xml: string = await getOneXml('stock_availables', id)
-        const doc = parseXML(xml)
-        const pid = getText(doc, 'id_product')
-        const cid = getText(doc, 'id_product_attribute')
-        const qty = parseInt(getText(doc, 'quantity')) || 0
+    const stocks = await getFullResource('stock_availables', '[id,id_product,id_product_attribute,quantity]')
+    for (const stock of stocks as any[]) {
+        const pid = stock.id_product || ''
+        const cid = stock.id_product_attribute || '0'
+        const qty = parseInt(stock.quantity || '0') || 0
         // Clé unique = productId_combinationId
         stockCache.set(`${pid}_${cid}`, qty)
-      })
-    )
+    }
     stockCacheLoaded = true
   } catch {
     stockCacheLoaded = false
@@ -161,6 +178,7 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
     const imageId = getMainImageId(doc)
     const name = getLangText(doc, 'name')
     const idCategoryDefault = getText(doc, 'id_category_default')
+    const availableDate = getProductReleaseDate(doc)
 
     // Récupérer TOUTES les catégories du produit (pas juste la catégorie par défaut)
     const categoryElements = doc.querySelectorAll('associations categories category')
@@ -178,6 +196,8 @@ async function loadSingleProduct(id: string): Promise<Product | null> {
       imageUrl:            getProductImageUrl(id, imageId),
       id_category_default: idCategoryDefault,
       category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
+      availableDate,
+      releaseBadge:        getReleaseBadge(availableDate),
       active:              getText(doc, 'active') === '1'
     }
   } catch {
@@ -239,6 +259,7 @@ export async function getProductById(id: string): Promise<ProductDetail> {
     const idTaxRulesGroup = getText(doc, 'id_tax_rules_group')
     const taxRate = await getTaxRate(idTaxRulesGroup)
     const imageId = getMainImageId(doc)
+    const availableDate = getProductReleaseDate(doc)
 
     // Récupérer les IDs des combinaisons
     const combinationElements = doc.querySelectorAll('associations combinations combination')
@@ -286,7 +307,10 @@ export async function getProductById(id: string): Promise<ProductDetail> {
       imageUrl:            getProductImageUrl(id, imageId),
       id_category_default: idCategoryDefault,
       category_ids:        categoryIds.length > 0 ? categoryIds : [idCategoryDefault],
+      availableDate,
+      releaseBadge:        getReleaseBadge(availableDate),
       active:              getText(doc, 'active') === '1',
+      stock:               getStockFromCache(id, '0'),
       combinations,
       hasCombinations:     combinations.length > 0
     }
@@ -301,17 +325,32 @@ export async function getProductById(id: string): Promise<ProductDetail> {
 /**
  * Récupère toutes les catégories (hors racine et accueil)
  */
+
+function labelDuplicateCategoryNames(categories: Category[]): Category[] {
+  const nameCounts = categories.reduce((counts, category) => {
+    counts.set(category.name, (counts.get(category.name) || 0) + 1)
+    return counts
+  }, new Map<string, number>())
+
+  return categories.map(category => {
+    if ((nameCounts.get(category.name) || 0) <= 1) return category
+    return {
+      ...category,
+      name: `${category.name} #${category.id}`,
+    }
+  })
+}
+
 export async function getAllCategories(): Promise<Category[]> {
   try {
-    const ids = await getAllIds('categories')
+    const rows = await getFullResource('categories', '[id,name,id_parent]')
     const categories: Category[] = []
 
-    for (const id of ids) {
+    for (const category of rows as any[]) {
       try {
-        const xml = await getOneXml('categories', id) as string
-        const doc = parseXML(xml)
-        const name = getLangText(doc, 'name')
-        const idParent = getText(doc, 'id_parent')
+        const id = category.id || ''
+        const name = category.name || ''
+        const idParent = category.id_parent || ''
         
         // Exclure la catégorie racine (id=1) et accueil (id=2)
         if (id !== '1' && id !== '2') {
@@ -327,9 +366,8 @@ export async function getAllCategories(): Promise<Category[]> {
       }
     }
 
-    // Trier par nom
-    categories.sort((a, b) => a.name.localeCompare(b.name))
-    return categories
+    return labelDuplicateCategoryNames(categories)
+      .sort((a, b) => a.name.localeCompare(b.name))
   } catch (error) {
     console.error('Erreur getAllCategories:', error)
     return []

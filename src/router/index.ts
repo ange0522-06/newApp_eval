@@ -6,14 +6,17 @@ import LoginView from '../BackOffice/views/LoginView.vue';
 import ImportView from '../BackOffice/views/ImportView.vue';
 import OrdersView from '../BackOffice/views/OrdersView.vue';
 import ResetView from '../BackOffice/views/ResetView.vue';
-import ForcedIdsView from '../BackOffice/views/ForcedIdsView.vue';
+import DashboardView from '../BackOffice/views/DashboardView.vue';
+import StocksView from '../BackOffice/views/StocksView.vue';
 
 // Front-Office Views
 import HomeView from '../FrontOffice/views/HomeView.vue';
 import ProductView from '../FrontOffice/views/ProductView.vue';
+import CartView from '../FrontOffice/views/CartView.vue';
 import CheckoutView from '../FrontOffice/views/CheckoutView.vue';
 import CustomerLogin from '../FrontOffice/views/CustomerLogin.vue';
 import CustomerRegister from '../FrontOffice/views/CustomerRegister.vue';
+import CustomerSelectView from '../FrontOffice/views/CustomerSelectView.vue';
 
 // Shared Views
 import LandingView from '../shared/views/LandingView.vue';
@@ -33,19 +36,39 @@ const routes: RouteRecordRaw[] = [
     component: LandingView,
     meta: { requiresAuth: false },
   },
+  {
+    path: '/landing',
+    component: LandingView,
+    meta: { requiresAuth: false },
+  },
+
+  // ==================== Front-Office entry ====================
+  {
+    path: '/front/customers',
+    name: 'CustomerSelect',
+    component: CustomerSelectView,
+    meta: { requiresAuth: false },
+  },
 
   // ==================== Front-Office ====================
   {
     path: '/home',
     name: 'Home',
     component: HomeView,
-    meta: { requiresAuth: false },
+    meta: { requiresAuth: true },
   },
   {
     path: '/product/:id',
     name: 'Product',
     component: ProductView,
-    meta: { requiresAuth: false },
+    meta: { requiresAuth: true },
+  },
+
+  {
+    path: '/cart',
+    name: 'Cart',
+    component: CartView,
+    meta: { requiresAuth: true },
   },
 
   {
@@ -81,6 +104,13 @@ const routes: RouteRecordRaw[] = [
 
   // Routes protégées (authentification requise)
   {
+    path: '/back/dashboard',
+    name: 'BackDashboard',
+    component: DashboardView,
+    meta: { requiresAuth: true },
+  },
+
+  {
     path: '/back/import',
     name: 'BackImport',
     component: ImportView,
@@ -95,10 +125,23 @@ const routes: RouteRecordRaw[] = [
   },
 
   {
+    path: '/back/stocks',
+    name: 'BackStocks',
+    component: StocksView,
+    meta: { requiresAuth: true },
+  },
+
+  {
     path: '/back/reset',
     name: 'BackReset',
     component: ResetView,
     meta: { requiresAuth: true },
+  },
+
+  // Toute URL /back inconnue doit revenir au login BO
+  {
+    path: '/back/:pathMatch(.*)*',
+    redirect: '/back/login',
   },
 
   // Catch-all - redirige vers back office par défaut
@@ -148,15 +191,15 @@ router.beforeEach((to, from) => {
       return { path: '/back/login', query: { redirect: to.fullPath } }
     }
     // Sinon, rediriger vers le login front-office
-    return { path: '/login', query: { redirect: to.fullPath } }
+    return { path: '/', query: { redirect: to.fullPath } }
   }
   // Si l'utilisateur est auth et essaie d'accéder au login
   else if (to.path === '/back/login' && isBackOfficeAuthenticated) {
     console.log(`✓ User déjà auth, redirection vers import`);
     return '/back/import';
-  } else if (to.path === '/login' && isCustomerAuthenticated) {
+  } else if ((to.path === '/login' || to.path === '/register') && isCustomerAuthenticated) {
     console.log(`✓ Client déjà connecté, redirection vers home`);
-    return '/home';
+    return typeof to.query.redirect === 'string' ? to.query.redirect : '/home';
   }
   // Sinon, continuer normalement
   else {

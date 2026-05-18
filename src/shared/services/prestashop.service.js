@@ -10,9 +10,63 @@ import { API_CONFIG } from '../../BackOffice/config/config';
 
 const BASE_URL = API_CONFIG.BASE_URL;
 const DEBUG_API = false;
+const DEFAULT_PAGE_SIZE = 250;
 
 function debugLog(...args) {
   if (DEBUG_API) console.log(...args);
+}
+
+function singularResourceName(resource) {
+  return resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+}
+
+function readResourceNode(node) {
+  const result = {
+    id: node.getAttribute('id') || node.querySelector(':scope > id')?.textContent?.trim() || ''
+  };
+
+  Array.from(node.children).forEach(child => {
+    result[child.tagName] = child.textContent?.trim() || '';
+  });
+
+  return result;
+}
+
+const NON_WRITABLE_FIELDS_BY_RESOURCE = {
+  products: [
+    'id_default_image',
+    'id_default_combination',
+    'manufacturer_name',
+    'position_in_category',
+    'quantity',
+    'type'
+  ],
+};
+
+/**
+ * Nettoie un XML provenant d'un GET avant de le renvoyer en PUT.
+ * PrestaShop renvoie certains champs calcules/non modifiables; si on les
+ * renvoie tels quels, le WebService refuse le PUT et le rollback echoue.
+ */
+export function sanitizeXmlForPut(resource, xmlBody) {
+  if (!xmlBody || typeof xmlBody !== 'string') return xmlBody;
+
+  try {
+    const doc = new DOMParser().parseFromString(xmlBody, 'text/xml');
+    if (doc.getElementsByTagName('parsererror').length > 0) return xmlBody;
+
+    doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
+
+    const fields = NON_WRITABLE_FIELDS_BY_RESOURCE[resource] || [];
+    for (const field of fields) {
+      Array.from(doc.getElementsByTagName(field)).forEach((element) => element.remove());
+    }
+
+    return new XMLSerializer().serializeToString(doc);
+  } catch (error) {
+    console.warn(`Nettoyage XML PUT impossible pour ${resource}, XML envoye tel quel.`, error);
+    return xmlBody;
+  }
 }
 
 /**
@@ -62,7 +116,7 @@ export async function getAllIds(resource) {
     }
 
     // Récupérer le nom singulier de la ressource (products -> product, stock_availables -> stock_available)
-    const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+    const singular = singularResourceName(resource);
     debugLog(`🔍 Cherche éléments singuliers: "${singular}"`);
     
     // Chercher tous les éléments enfants directs avec le nom singulier
@@ -73,6 +127,60 @@ export async function getAllIds(resource) {
     return ids;
   } catch (error) {
     console.error(`❌ Erreur getAllIds(${resource}):`, error);
+    throw error;
+  }
+}
+
+function buildListUrl(resource, display, offset, limit) {
+  return `${BASE_URL}/${resource}?display=${display}&limit=${offset},${limit}`;
+}
+
+function readResourceNodes(xmlText, resource) {
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+
+  if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
+    console.error(`Erreur de parsing XML pour ${resource}:`, xmlDoc);
+    return [];
+  }
+
+  const singular = singularResourceName(resource);
+  const container = xmlDoc.querySelector(resource);
+  return container
+    ? Array.from(container.children).filter(child => child.tagName === singular)
+    : Array.from(xmlDoc.querySelectorAll(singular));
+}
+
+/**
+ * Recupere une ressource par pages. Passer un display cible comme
+ * "[id,name]" evite les reponses display=full trop lourdes.
+ */
+export async function getFullResource(resource, display = 'full', options = {}) {
+  try {
+    const pageSize = options.pageSize || DEFAULT_PAGE_SIZE;
+    const result = [];
+
+    for (let offset = 0; ; offset += pageSize) {
+      const response = await fetch(buildListUrl(resource, display, offset, pageSize), {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'text/xml'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const nodes = readResourceNodes(await response.text(), resource);
+      result.push(...nodes.map(readResourceNode).filter(item => item.id));
+
+      if (nodes.length < pageSize) break;
+    }
+
+    return result;
+  } catch (error) {
+    console.error(`Erreur getFullResource(${resource}):`, error);
     throw error;
   }
 }
@@ -101,7 +209,7 @@ export async function getOne(resource, id) {
     const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
 
     // Récupérer le nom singulier de la ressource
-    const singular = resource.endsWith('ies') ? resource.slice(0, -3) + 'y' : resource.slice(0, -1);
+    const singular = singularResourceName(resource);
     
     // Chercher l'élément de ressource
     let resourceElement = xmlDoc.querySelector(singular);
@@ -181,12 +289,13 @@ export async function getOneXml(resource, id, options = {}) {
  */
 export async function putXML(resource, id, xmlBody) {
   try {
+    const body = sanitizeXmlForPut(resource, xmlBody);
     const response = await fetch(`${BASE_URL}/${resource}/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'text/xml'
       },
-      body: xmlBody
+      body
     });
 
     if (!response.ok) {
@@ -194,7 +303,7 @@ export async function putXML(resource, id, xmlBody) {
       
       // Log the XML we sent for easier debugging (similar to postXML)
       try {
-        console.error(`📋 XML envoyé (PUT ${resource}/${id}):\n${xmlBody}`);
+        console.error(`📋 XML envoyé (PUT ${resource}/${id}):\n${body}`);
       } catch (e) {
         // ignore logging errors
       }
@@ -356,6 +465,30 @@ export async function postXML(resource, xmlBody) {
       console.error(`❌ POST échoué pour ${resource}:`, errorMsg);
       console.error(`📋 XML envoyé (COMPLET):\n${xmlBody}`);
       console.error(`📨 Réponse serveur (${errorText.length} chars):\n${errorText || '(VIDE)'}`);
+      
+      // Si HTTP 500 avec réponse vide, donner des instructions claires
+      if (response.status >= 500 && (!errorText || errorText.trim() === '')) {
+        const debugMsg = [
+          `\n⚠️  ERREUR SERVEUR AVEC RÉPONSE VIDE (HTTP ${response.status})`,
+          `\nRessource: ${resource}`,
+          `URL: ${BASE_URL}/${resource}`,
+          `XML envoyé:\n${xmlBody}`,
+          `\n🔧 DIAGNOSTIC:`,
+          `1. Vérifier les logs PrestaShop:`,
+          `   - eval/var/logs/dev.log`,
+          `   - eval/var/logs/prod.log`,
+          `2. Vérifier les logs Apache:`,
+          `   - xampp/apache/logs/error.log`,
+          `3. Possibles causes:`,
+          `   - Erreur PHP ou SQL dans PrestaShop`,
+          `   - Données invalides ou doubloon d'identifiant`,
+          `   - Attributs XML non reconnus ou mal formés`,
+          `   - Permissions insuffisantes sur la ressource`,
+          `\nConsulter les logs mentionnés ci-dessus pour plus de détails.`
+        ].join('\n');
+        console.error(debugMsg);
+      }
+      
       return { success: false, error: errorMsg };
     }
 

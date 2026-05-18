@@ -11,6 +11,8 @@
  */
 export function getAllIds(resource: string): Promise<string[]>
 
+export function getFullResource(resource: string): Promise<Array<Record<string, string>>>
+
 /**
  * Récupère une ressource spécifique par son ID
  * @param resource - Nom de la ressource
@@ -27,13 +29,18 @@ export function getOne(resource: string, id: string): Promise<string>
  */
 export function getOneXml(resource: string, id: string, options?: { silent404?: boolean }): Promise<string | null>
 
+export function sanitizeXmlForPut(resource: string, xmlBody: string): string
+
 /**
  * Crée une nouvelle ressource via POST
  * @param resource - Nom de la ressource
  * @param xmlBody - Corps de la requête en XML
  * @returns true si succès, false sinon
  */
-export function postXML(resource: string, xmlBody: string): Promise<boolean>
+export function postXML(
+  resource: string,
+  xmlBody: string
+): Promise<{ success: boolean, id?: string, error?: string }>
 
 /**
  * Met à jour une ressource via PUT

@@ -1,9 +1,10 @@
-import {
+﻿import {
   getAllIds,
   getOne,
   getOneXml,
   postXML,
   putXML,
+  deleteResource,
   uploadProductImage,
 } from '../../shared/services/prestashop.service.js';
 import { API_CONFIG } from '../config/config';
@@ -20,9 +21,13 @@ const ID_SHOP_GROUP = 1;
 const ID_LANG = 1;
 const ID_CURRENCY = 1;
 const FALLBACK_ACTIVE_COUNTRY_ID = '8';
-const DEFAULT_CUSTOMER_GROUP = 3;
+const DEFAULT_CUSTOMER_GROUP = 1;
 const DEFAULT_EMPLOYEE = 1;
 const INITIAL_ORDER_STATE = '1';
+// ✅ États de commande selon PrestaShop et le PDF
+const ORDER_STATE_PAID = '2';           // "Paiement effectué"
+const ORDER_STATE_DELIVERED = '5';     // "Livré" (état standard PrestaShop)
+const ORDER_STATE_CANCELLED = '6';     // "Annulé"
 
 type CreatedResponse = { success?: boolean; id?: string | number; error?: string };
 type ImagePayload = { name: string; mime: string; base64: string };
@@ -44,26 +49,63 @@ type CombinationInfo = {
   priceTTC: number;
 };
 
+const RESOURCE_DISPLAY_FIELDS: Record<string, string> = {
+  products: '[id,reference,name,price,available_date]',
+  categories: '[id,name,active,id_parent]',
+  taxes: '[id,rate,active,name]',
+  tax_rule_groups: '[id,name,active,deleted]',
+  tax_rules: '[id,id_tax_rules_group,id_country,id_tax]',
+  countries: '[id,iso_code,active]',
+  product_options: '[id,name,public_name,is_color_group]',
+  product_option_values: '[id,id_attribute_group,name]',
+  stock_availables: '[id,id_product,id_product_attribute,quantity]',
+  combinations: '[id,id_product,reference,default_on]',
+  specific_price_rules: '[id,name,price,from_quantity,reduction_type]',
+  customers: '[id,email,secure_key,firstname,lastname]',
+  carriers: '[id,active,deleted]',
+};
+const RESOURCE_PAGE_SIZE = 250;
+
 const productsByReference = new Map<string, ProductInfo>();
 const combinationsByReferenceAndValue = new Map<string, CombinationInfo>();
 const resourceFullCache = new Map<string, Map<string, Record<string, string>>>();
+const resourceFullInflight = new Map<string, Promise<Map<string, Record<string, string>>>>();
 const stockAvailableByProductKey = new Map<string, string>();
 const combinationIdByProductAndValueId = new Map<string, string>();
+const combinationIdByProductAndReference = new Map<string, string>();
+const productWithDefaultCombination = new Set<string>();
+const productsMarkedAsCombinations = new Set<string>();
+const productOptionInflight = new Map<string, Promise<string>>();
+const productOptionValueInflight = new Map<string, Promise<string>>();
+const customerInflight = new Map<string, Promise<{ id: string; secureKey: string }>>();
 let stockAvailableCacheLoaded = false;
 let combinationCacheLoaded = false;
 let defaultCountryId: string | null = null;
+let stockAvailableCacheInflight: Promise<void> | null = null;
 
 function resetImportCaches(): void {
   resourceFullCache.clear();
+  resourceFullInflight.clear();
   stockAvailableByProductKey.clear();
   combinationIdByProductAndValueId.clear();
+  combinationIdByProductAndReference.clear();
+  productWithDefaultCombination.clear();
+  productsMarkedAsCombinations.clear();
+  productOptionInflight.clear();
+  productOptionValueInflight.clear();
+  customerInflight.clear();
   stockAvailableCacheLoaded = false;
   combinationCacheLoaded = false;
+  stockAvailableCacheInflight = null;
   defaultCountryId = null;
 }
 
 function normalize(value: string): string {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+function isPaidLikeOrderState(stateId: string): boolean {
+  return stateId === ORDER_STATE_PAID || stateId === ORDER_STATE_DELIVERED;
 }
 
 function xml(value: string | number): string {
@@ -124,11 +166,62 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Response> {
+/**
+ * ✅ OPTIMISATION: Traite les items par lots avec parallélisme amélioré
+ * @param items Items à traiter
+ * @param batchSize Nombre d'items par lot (défaut: 20)
+ * @param handler Fonction de traitement
+ * @param maxConcurrency Nombre max de traitements parallèles par lot (défaut: 5)
+ */
+async function processInBatches<T>(
+  items: T[], 
+  batchSize: number, 
+  handler: (item: T, index: number) => Promise<void>,
+  maxConcurrency = 5
+): Promise<void> {
+  for (let start = 0; start < items.length; start += batchSize) {
+    const batch = items.slice(start, start + batchSize);
+    let nextBatchIndex = 0;
+    let firstError: unknown = null;
+
+    async function worker(): Promise<void> {
+      while (firstError === null && nextBatchIndex < batch.length) {
+        const localIndex = nextBatchIndex;
+        nextBatchIndex += 1;
+        const itemIndex = start + localIndex;
+
+        try {
+          await handler(batch[localIndex], itemIndex);
+        } catch (error) {
+          console.error(`Erreur item ${itemIndex}:`, error);
+          if (firstError === null) firstError = error;
+        }
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(maxConcurrency, batch.length) }, () => worker())
+    );
+
+    if (firstError !== null) throw firstError;
+  }
+}
+
+function buildResourceListUrl(resource: string, display: string, offset: number, limit: number): string {
+  return `${API_CONFIG.BASE_URL}/${resource}?display=${display}&limit=${offset},${limit}`;
+}
+
+async function fetchResourceWithRetry(
+  resource: string,
+  display = RESOURCE_DISPLAY_FIELDS[resource] || 'full',
+  offset = 0,
+  limit = RESOURCE_PAGE_SIZE,
+  retries = 2
+): Promise<Response> {
   let lastResponse: Response | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const response = await fetch(`${API_CONFIG.BASE_URL}/${resource}?display=full`, {
+    const response = await fetch(buildResourceListUrl(resource, display, offset, limit), {
       method: 'GET',
       headers: { 'Content-Type': 'text/xml' },
     });
@@ -144,33 +237,54 @@ async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Re
   return lastResponse as Response;
 }
 
+function readResourceNodes(resource: string, xmlText: string): Element[] {
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  const singular = getSingularResourceName(resource);
+  const container = doc.querySelector(resource);
+  return container
+    ? Array.from(container.children).filter((child) => child.tagName === singular)
+    : Array.from(doc.querySelectorAll(singular));
+}
+
 async function loadFullResource(resource: string): Promise<Map<string, Record<string, string>>> {
   const cached = resourceFullCache.get(resource);
   if (cached) return cached;
 
-  const response = await fetchResourceWithRetry(resource);
+  const inflight = resourceFullInflight.get(resource);
+  if (inflight) return inflight;
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
+  const promise = (async () => {
+    const display = RESOURCE_DISPLAY_FIELDS[resource] || 'full';
+    const map = new Map<string, Record<string, string>>();
+
+    for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+      const response = await fetchResourceWithRetry(resource, display, offset, RESOURCE_PAGE_SIZE);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
+      }
+
+      const nodes = readResourceNodes(resource, await response.text());
+
+      for (const node of nodes) {
+        const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
+        if (id) map.set(id, readResourceNode(node));
+      }
+
+      if (nodes.length < RESOURCE_PAGE_SIZE) break;
+    }
+
+    resourceFullCache.set(resource, map);
+    return map;
+  })();
+
+  resourceFullInflight.set(resource, promise);
+  try {
+    return await promise;
+  } finally {
+    resourceFullInflight.delete(resource);
   }
-
-  const xmlText = await response.text();
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const singular = getSingularResourceName(resource);
-  const container = doc.querySelector(resource);
-  const nodes = container
-    ? Array.from(container.children).filter((child) => child.tagName === singular)
-    : Array.from(doc.querySelectorAll(singular));
-  const map = new Map<string, Record<string, string>>();
-
-  for (const node of nodes) {
-    const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
-    if (id) map.set(id, readResourceNode(node));
-  }
-
-  resourceFullCache.set(resource, map);
-  return map;
 }
 
 function cacheResource(resource: string, id: string, data: Record<string, string>): void {
@@ -186,12 +300,24 @@ function getCachedResource(resource: string, id: string): Record<string, string>
   return resourceFullCache.get(resource)?.get(id) || null;
 }
 
+function invalidateCachedResource(resource: string, id: string): void {
+  resourceFullCache.get(resource)?.delete(id);
+}
+
+function invalidateAllCachedResource(resource: string): void {
+  resourceFullCache.delete(resource);
+}
+
 function stockKey(productId: string, combinationId = '0'): string {
   return `${productId}::${combinationId || '0'}`;
 }
 
 function combinationValueKey(productId: string, attributeValueId: string): string {
   return `${productId}::${attributeValueId}`;
+}
+
+function combinationReferenceKey(productId: string, reference: string): string {
+  return `${productId}::${normalize(reference)}`;
 }
 
 async function postRequired(resource: string, body: string, label: string): Promise<string> {
@@ -228,6 +354,21 @@ async function findTaxByRate(rate: number): Promise<string | null> {
   return null;
 }
 
+async function findTaxRule(groupId: string, countryId: string, taxId: string): Promise<string | null> {
+  const rules = await loadFullResource('tax_rules');
+  for (const [id, data] of rules) {
+    if (
+      data.id_tax_rules_group === groupId
+      && data.id_country === countryId
+      && data.id_tax === taxId
+    ) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
 async function getDefaultCountryId(): Promise<string> {
   const forced = localStorage.getItem('forced_id_country');
   if (forced) return forced;
@@ -249,8 +390,6 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
   const percent = (rate * 100).toFixed(2);
   const countryId = await getDefaultCountryId();
   const groupName = `Import Tax ${percent}% Country ${countryId}`;
-  const existingGroup = await findByField('tax_rule_groups', 'name', groupName);
-  if (existingGroup) return existingGroup;
 
   let taxId = await findTaxByRate(rate);
   if (!taxId) {
@@ -270,20 +409,53 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
     cacheResource('taxes', taxId, { rate: percent, active: '1', name: `Tax ${percent}%` });
   }
 
-  const groupId = await postRequired(
-    'tax_rule_groups',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  let groupId = await findByField('tax_rule_groups', 'name', groupName);
+  if (!groupId) {
+    const groupXml = `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <tax_rule_group>
     <name>${cdata(groupName)}</name>
     <active>1</active>
     <deleted>0</deleted>
   </tax_rule_group>
-</prestashop>`,
-    `Groupe taxe ${percent}%`
-  );
-  transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
-  cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+</prestashop>`;
+    const result = (await postXML('tax_rule_groups', groupXml)) as unknown as CreatedResponse;
+    if (result?.success && result.id) {
+      groupId = String(result.id);
+      transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
+      cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+    } else {
+      // HTTP 500 avec réponse vide = PrestaShop a peut-être quand même inséré la ligne
+      // (doublon en DB, contrainte unique violée côté PHP). On force un rechargement du cache
+      // et on cherche par nom avant de considérer l'opération comme un vrai échec.
+      resourceFullCache.delete('tax_rule_groups');
+      await wait(300);
+      groupId = await findByField('tax_rule_groups', 'name', groupName);
+      if (!groupId) {
+        // Dernière tentative : chercher sans accent / normalisation (PrestaShop peut tronquer le CDATA)
+        const allGroups = await loadFullResource('tax_rule_groups');
+        for (const [id, data] of allGroups) {
+          const storedName = data.name || '';
+          if (
+            normalize(storedName).includes(normalize(`${percent}%`))
+            || normalize(storedName).includes(normalize(`Country ${countryId}`))
+          ) {
+            groupId = id;
+            break;
+          }
+        }
+      }
+      if (!groupId) {
+        throw new Error(`Groupe taxe ${percent}%: creation refusee par l'API${result?.error ? ` (${result.error})` : ''}`);
+      }
+      transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
+      cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+      console.log(`♻️  Groupe taxe ${percent}% récupéré depuis l'API après erreur 500 (doublon probable): id=${groupId}`);
+    }
+  }
+
+  const existingRule = await findTaxRule(groupId, countryId, taxId);
+  if (existingRule) return groupId;
 
   const ruleId = await postRequired(
     'tax_rules',
@@ -303,7 +475,7 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
     `Regle taxe ${percent}%`
   );
   transaction.trackResource('fichier1', 'tax_rules', ruleId);
-  cacheResource('tax_rules', ruleId, { id_tax_rules_group: groupId, id_tax: taxId });
+  cacheResource('tax_rules', ruleId, { id_tax_rules_group: groupId, id_country: countryId, id_tax: taxId });
 
   return groupId;
 }
@@ -339,7 +511,132 @@ function setFirstTag(doc: Document, tagName: string, value: string | number): vo
 }
 
 function removeNotWritableFields(doc: Document): void {
+  // ✅ CRITIQUE: Ne JAMAIS supprimer date_add et date_upd
+  // Ces dates doivent venir du fichier d'import et être préservées dans PrestaShop
+  // Supprimer les champs non modifiables PrestaShop
+  const nonWritableFields = [
+    'id', 'views', 'rating', 'indexed',
+    'position_in_category', 'similarity', 'cache', 'status'
+    // ✅ 'date_add' et 'date_upd' ENLEVÉS - on les préserve toujours
+  ];
+  
   doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
+  nonWritableFields.forEach((fieldName) => {
+    const elements = doc.getElementsByTagName(fieldName);
+    // Garder le premier pour les champs qui peuvent être enfants (comme <id>)
+    // mais supprimer les duplicatas et les champs de métadonnées
+    if (fieldName === 'id') return; // <id> est nécessaire pour PUT
+    while (elements.length > 1) {
+      elements[elements.length - 1].remove();
+    }
+  });
+}
+
+async function updateProductTypeToCombinations(productId: string, transaction: ImportTransaction): Promise<void> {
+  if (productsMarkedAsCombinations.has(productId)) return;
+
+  console.log(`🔄 [PRODUIT ${productId}] Changement du type en mode "combinations"...`);
+  
+  let retryCount = 0;
+  const maxRetries = 5; // ⬆️ Augmenté à 5
+  
+  while (retryCount < maxRetries) {
+    try {
+      console.log(`  📋 [PRODUIT ${productId}] Tentative ${retryCount + 1}/${maxRetries}...`);
+      
+      // 1. Récupérer le XML complet du produit
+      const productXml = (await getOneXml('products', productId)) as string;
+      const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+      
+      // 2. Vérifier le type ACTUEL
+      const currentType = doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type AVANT: "${currentType}"`);
+      
+      if (currentType === 'combinations') {
+        console.log(`  ✅ [PRODUIT ${productId}] Déjà en mode "combinations"`);
+        productsMarkedAsCombinations.add(productId);
+        return;
+      }
+      
+      // 3. Nettoyer et préparer le XML pour PUT
+      removeNotWritableFields(doc);
+      const previousWritableXml = new XMLSerializer().serializeToString(doc);
+      
+      // 4. Changer product_type en "combinations"
+      setFirstTag(doc, 'product_type', 'combinations');
+      const nextXml = new XMLSerializer().serializeToString(doc);
+      
+      console.log(`  📤 [PRODUIT ${productId}] Envoi du PUT...`);
+      const ok = await putXML('products', productId, nextXml);
+      
+      if (!ok) {
+        console.warn(`  ⚠️  [PRODUIT ${productId}] PUT retourné false`);
+        retryCount += 1;
+        await wait(2000 * retryCount); // Délai exponentiel
+        continue;
+      }
+      
+      console.log(`  ⏳ [PRODUIT ${productId}] Attente 2000ms pour synchronisation BD...`);
+      await wait(2000);
+      
+      // 🔴 INVALIDER LE CACHE POUR FORCER UN RELOAD DEPUIS L'API
+      console.log(`  🔄 [PRODUIT ${productId}] Invalidation du cache (forcer reload depuis l'API)...`);
+      invalidateCachedResource('products', productId);
+      invalidateAllCachedResource('products');
+      
+      // 5. VÉRIFICATION #1 - Recharger et checker immédiatement
+      console.log(`  🔍 [PRODUIT ${productId}] Vérification #1...`);
+      const verify1Xml = (await getOneXml('products', productId)) as string;
+      const verify1Doc = new DOMParser().parseFromString(verify1Xml, 'text/xml');
+      const type1 = verify1Doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type après PUT: "${type1}"`);
+      
+      if (type1 !== 'combinations') {
+        console.warn(`  ⚠️  [PRODUIT ${productId}] Changement non appliqué. Nouvelle attente...`);
+        retryCount += 1;
+        await wait(3000 * retryCount); // Délai encore plus long
+        continue;
+      }
+      
+      // 6. VÉRIFICATION #2 - Attendre puis recharger à nouveau
+      console.log(`  ⏳ [PRODUIT ${productId}] Attente supplémentaire 3000ms...`);
+      await wait(3000);
+      
+      console.log(`  🔍 [PRODUIT ${productId}] Vérification #2 (finale)...`);
+      const verify2Xml = (await getOneXml('products', productId)) as string;
+      const verify2Doc = new DOMParser().parseFromString(verify2Xml, 'text/xml');
+      const type2 = verify2Doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type après vérification finale: "${type2}"`);
+      
+      if (type2 !== 'combinations') {
+        console.error(`  ❌ [PRODUIT ${productId}] ERREUR CRITIQUE: Le type a disparu après vérification!`);
+        console.error(`  XML du produit:`, verify2Xml);
+        retryCount += 1;
+        if (retryCount >= maxRetries) {
+          throw new Error(
+            `[PRODUIT ${productId}] ERREUR APRÈS ${maxRetries} TENTATIVES: Le type n'a pas changé en "combinations" (type="${type2}"). ` +
+            `PrestaShop rejette probablement ce changement. Vérifier eval/var/logs/dev.log`
+          );
+        }
+        await wait(4000);
+        continue;
+      }
+      
+      console.log(`  ✅ [PRODUIT ${productId}] SUCCÈS - Changement confirmé`);
+      
+      // Tracker le changement pour rollback
+      productsMarkedAsCombinations.add(productId);
+      transaction.trackUpdate('fichier2', 'products', productId, previousWritableXml);
+      return; // Succès
+    } catch (error) {
+      console.error(`  ❌ [PRODUIT ${productId}] Erreur à la tentative ${retryCount + 1}:`, error);
+      if (retryCount >= maxRetries - 1) {
+        throw error;
+      }
+      retryCount += 1;
+      await wait(5000);
+    }
+  }
 }
 
 async function updateResourceField(
@@ -367,69 +664,83 @@ async function updateResourceField(
 }
 
 async function loadAllStockAvailables(): Promise<Array<{ id: string; id_product: string; id_product_attribute: string; quantity: string }>> {
-  const response = await fetch(`${API_CONFIG.BASE_URL}/stock_availables?display=full`, {
-    method: 'GET',
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  const allStocks: Array<{ id: string; id_product: string; id_product_attribute: string; quantity: string }> = [];
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
+  for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+    const response = await fetchResourceWithRetry(
+      'stock_availables',
+      RESOURCE_DISPLAY_FIELDS.stock_availables,
+      offset,
+      RESOURCE_PAGE_SIZE
+    );
 
-  const xmlText = await response.text();
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const nodes = Array.from(doc.querySelectorAll('stock_availables stock_available, stock_available'));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
 
-  return nodes
-    .map((node) => ({
+    const nodes = readResourceNodes('stock_availables', await response.text());
+    allStocks.push(...nodes.map((node) => ({
       id: node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '',
       id_product: node.querySelector('id_product')?.textContent?.trim() || '',
       id_product_attribute: node.querySelector('id_product_attribute')?.textContent?.trim() || '0',
       quantity: node.querySelector('quantity')?.textContent?.trim() || '0',
-    }))
-    .filter((stock) => Boolean(stock.id));
+    })).filter((stock) => Boolean(stock.id)));
+
+    if (nodes.length < RESOURCE_PAGE_SIZE) break;
+  }
+
+  return allStocks;
+}
+
+async function loadStockAvailableCache(force = false): Promise<void> {
+  if (stockAvailableCacheLoaded && !force) return;
+  if (stockAvailableCacheInflight) return stockAvailableCacheInflight;
+
+  stockAvailableCacheInflight = (async () => {
+    const stocks = await loadAllStockAvailables();
+    stockAvailableByProductKey.clear();
+    for (const stock of stocks) {
+      stockAvailableByProductKey.set(stockKey(stock.id_product, stock.id_product_attribute), stock.id);
+      cacheResource('stock_availables', stock.id, {
+        id_product: stock.id_product,
+        id_product_attribute: stock.id_product_attribute,
+        quantity: stock.quantity,
+      });
+    }
+    stockAvailableCacheLoaded = true;
+  })();
+
+  try {
+    await stockAvailableCacheInflight;
+  } finally {
+    stockAvailableCacheInflight = null;
+  }
 }
 
 async function findStockAvailableId(productId: string, combinationId = '0'): Promise<string | null> {
   try {
-    if (!stockAvailableCacheLoaded) {
-      const stocks = await loadAllStockAvailables();
-      stockAvailableByProductKey.clear();
-      for (const stock of stocks) {
-        stockAvailableByProductKey.set(stockKey(stock.id_product, stock.id_product_attribute), stock.id);
-        cacheResource('stock_availables', stock.id, {
-          id_product: stock.id_product,
-          id_product_attribute: stock.id_product_attribute,
-          quantity: stock.quantity,
-        });
-      }
-      stockAvailableCacheLoaded = true;
-    }
+    await loadStockAvailableCache();
     const match = stockAvailableByProductKey.get(stockKey(productId, combinationId));
     if (match) return match;
   } catch (error) {
-    console.warn('Chargement global de stock_availables impossible, fallback sur la recherche id par id.', error);
+    console.warn('Chargement global de stock_availables impossible, fallback sur création. Raison:', error);
+    // ✅ Si le chargement global échoue, ne pas essayer le fallback ID par ID (trop d'erreurs 404)
+    // Laisser updateStock() créer le stock directement
+    return null;
   }
 
-  const ids = await getAllIds('stock_availables');
-  for (const id of ids) {
-    try {
-      const stockXml = await getOneXml('stock_availables', id, { silent404: true });
-      if (!stockXml) continue;
-      const stockDoc = new DOMParser().parseFromString(stockXml, 'text/xml');
-      const stock = {
-        id_product: stockDoc.querySelector('id_product')?.textContent?.trim() || '',
-        id_product_attribute: stockDoc.querySelector('id_product_attribute')?.textContent?.trim() || '0',
-      };
-      if (stock.id_product === productId && String(stock.id_product_attribute || '0') === String(combinationId)) {
-        stockAvailableByProductKey.set(stockKey(productId, combinationId), id);
-        return id;
-      }
-    } catch (error) {
-      console.warn(`Stock introuvable ou inaccessible pour stock_availables/${id}, on ignore.`, error);
-    }
-  }
+  const match = stockAvailableByProductKey.get(stockKey(productId, combinationId));
+  if (match) return match;
+  
+  // ✅ Si pas trouvé en cache, retourner null plutôt que de faire des GET 404s
   return null;
+}
+
+function resetStockCache(): void {
+  stockAvailableByProductKey.clear();
+  stockAvailableCacheLoaded = false;
+  stockAvailableCacheInflight = null;
+  console.log('🔄 Cache des stocks réinitialisé pour rechargement');
 }
 
 async function updateStock(
@@ -442,25 +753,22 @@ async function updateStock(
 ): Promise<void> {
   let stockId = await findStockAvailableId(productId, combinationId);
   if (!stockId) {
-    stockId = await postRequired(
-      'stock_availables',
-      `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <stock_available>
-    <id_product>${productId}</id_product>
-    <id_product_attribute>${combinationId}</id_product_attribute>
-    <id_shop>${ID_SHOP}</id_shop>
-    <id_shop_group>0</id_shop_group>
-    <quantity>${quantity}</quantity>
-    <depends_on_stock>0</depends_on_stock>
-    <out_of_stock>0</out_of_stock>
-  </stock_available>
-</prestashop>`,
-      `Stock produit ${productId}/${combinationId}`
-    );
-    transaction.trackResource(step, 'stock_availables', stockId);
-    stockAvailableByProductKey.set(stockKey(productId, combinationId), stockId);
-    return;
+    // ✅ CRITICAL FIX: PrestaShop crée automatiquement stock_available après combination
+    // Le cache n'est peut-être pas à jour. Forcer rechargement du cache des stocks
+    console.log(`⚠️  Stock non trouvé en cache pour ${productId}/${combinationId}, rechargement du cache...`);
+    await loadStockAvailableCache(true);
+    
+    // Chercher à nouveau après rechargement
+    stockId = stockAvailableByProductKey.get(stockKey(productId, combinationId)) ?? null;
+    if (!stockId) {
+      // ✅ Si toujours pas trouvé, le stock n'existe vraiment pas (erreur d'API)
+      // Ne pas faire POST (405 Method Not Allowed)
+      throw new Error(
+        `Stock produit ${productId}/${combinationId}: ` +
+        `impossible de créer (PrestaShop n'autorise pas POST sur stock_availables). ` +
+        `Vérifier que la combination a été créée correctement.`
+      );
+    }
   }
 
   await updateResourceField(transaction, step, 'stock_availables', stockId, 'quantity', quantity, trackUpdate);
@@ -479,8 +787,9 @@ async function uploadImagesWithLimit(
       const product = products[nextIndex];
       nextIndex += 1;
       const image = imageMap[product.reference];
+      // Skip if image not found - images are optional
       if (!image) {
-        throw new Error(`Image manquante dans le zip pour la reference ${product.reference}`);
+        continue;
       }
 
       const result = await uploadProductImage(product.id, imagePayloadToFile(image));
@@ -497,12 +806,17 @@ async function uploadImagesWithLimit(
 }
 
 async function ensureProductOption(name: string, transaction: ImportTransaction): Promise<string> {
-  const existing = await findByField('product_options', 'name', name);
-  if (existing) return existing;
+  const cacheKey = normalize(name);
+  const inflight = productOptionInflight.get(cacheKey);
+  if (inflight) return inflight;
 
-  const id = await postRequired(
-    'product_options',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  const promise = (async () => {
+    const existing = await findByField('product_options', 'name', name);
+    if (existing) return existing;
+
+    const id = await postRequired(
+      'product_options',
+      `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <product_option>
     <is_color_group>${normalize(name) === 'couleur' ? 1 : 0}</is_color_group>
@@ -512,28 +826,41 @@ async function ensureProductOption(name: string, transaction: ImportTransaction)
     <public_name><language id="${ID_LANG}">${cdata(name)}</language></public_name>
   </product_option>
 </prestashop>`,
-    `Groupe attribut ${name}`
-  );
-  transaction.trackResource('fichier2', 'product_options', id);
-  cacheResource('product_options', id, {
-    name,
-    public_name: name,
-    is_color_group: normalize(name) === 'couleur' ? '1' : '0',
-  });
-  return id;
+      `Groupe attribut ${name}`
+    );
+    transaction.trackResource('fichier2', 'product_options', id);
+    cacheResource('product_options', id, {
+      name,
+      public_name: name,
+      is_color_group: normalize(name) === 'couleur' ? '1' : '0',
+    });
+    return id;
+  })();
+
+  productOptionInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    productOptionInflight.delete(cacheKey);
+  }
 }
 
 async function ensureProductOptionValue(groupId: string, value: string, transaction: ImportTransaction): Promise<string> {
-  const values = await loadFullResource('product_option_values');
-  for (const [id, data] of values) {
-    if (data.id_attribute_group === groupId && normalize(data.name || '') === normalize(value)) {
-      return id;
-    }
-  }
+  const cacheKey = `${groupId}::${normalize(value)}`;
+  const inflight = productOptionValueInflight.get(cacheKey);
+  if (inflight) return inflight;
 
-  const id = await postRequired(
-    'product_option_values',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  const promise = (async () => {
+    const values = await loadFullResource('product_option_values');
+    for (const [id, data] of values) {
+      if (data.id_attribute_group === groupId && normalize(data.name || '') === normalize(value)) {
+        return id;
+      }
+    }
+
+    const id = await postRequired(
+      'product_option_values',
+      `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <product_option_value>
     <id_attribute_group>${groupId}</id_attribute_group>
@@ -542,39 +869,57 @@ async function ensureProductOptionValue(groupId: string, value: string, transact
     <name><language id="${ID_LANG}">${cdata(value)}</language></name>
   </product_option_value>
 </prestashop>`,
-    `Valeur attribut ${value}`
-  );
-  transaction.trackResource('fichier2', 'product_option_values', id);
-  cacheResource('product_option_values', id, { id_attribute_group: groupId, name: value });
-  return id;
+      `Valeur attribut ${value}`
+    );
+    transaction.trackResource('fichier2', 'product_option_values', id);
+    cacheResource('product_option_values', id, { id_attribute_group: groupId, name: value });
+    return id;
+  })();
+
+  productOptionValueInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    productOptionValueInflight.delete(cacheKey);
+  }
 }
 
 function combinationKey(reference: string, karazany: string): string {
   return `${normalize(reference)}::${normalize(karazany)}`;
 }
 
-async function findCombination(productId: string, attributeValueId: string): Promise<string | null> {
-  const cacheKey = combinationValueKey(productId, attributeValueId);
-  const cached = combinationIdByProductAndValueId.get(cacheKey);
-  if (cached) return cached;
-
+async function loadCombinationCache(force = false): Promise<void> {
+  if (combinationCacheLoaded && !force) return;
   if (!combinationCacheLoaded) {
-    try {
-      const response = await fetch(`${API_CONFIG.BASE_URL}/combinations?display=full`, {
-        method: 'GET',
-        headers: { 'Content-Type': 'text/xml' },
-      });
+    force = true;
+  }
+
+  try {
+    if (force) {
+      combinationIdByProductAndValueId.clear();
+      combinationIdByProductAndReference.clear();
+      productWithDefaultCombination.clear();
+    }
+
+    for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+      const response = await fetchResourceWithRetry('combinations', 'full', offset, RESOURCE_PAGE_SIZE);
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      const xmlText = await response.text();
-      const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-      const nodes = Array.from(doc.querySelectorAll('combinations > combination, prestashop > combination, combination'));
+      const nodes = readResourceNodes('combinations', await response.text());
       for (const node of nodes) {
         const combinationId = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
         const idProduct = node.querySelector('id_product')?.textContent?.trim() || '';
+        const reference = node.querySelector('reference')?.textContent?.trim() || '';
+        const defaultOn = node.querySelector('default_on')?.textContent?.trim() || '';
+        if (combinationId && idProduct && reference) {
+          combinationIdByProductAndReference.set(combinationReferenceKey(idProduct, reference), combinationId);
+        }
+        if (combinationId && idProduct && defaultOn === '1') {
+          productWithDefaultCombination.add(idProduct);
+        }
         const values = Array.from(node.querySelectorAll('associations product_option_values product_option_value id'))
           .map((valueNode) => valueNode.textContent?.trim())
           .filter((value): value is string => Boolean(value));
@@ -584,13 +929,26 @@ async function findCombination(productId: string, attributeValueId: string): Pro
           }
         }
       }
-      combinationCacheLoaded = true;
-    } catch (error) {
-      console.warn('Chargement global des declinaisons impossible, fallback sur la recherche id par id.', error);
-    }
-  }
 
-  const loaded = combinationIdByProductAndValueId.get(cacheKey);
+      if (nodes.length < RESOURCE_PAGE_SIZE) break;
+    }
+    combinationCacheLoaded = true;
+  } catch (error) {
+    console.warn('Chargement global des declinaisons impossible, fallback sur la recherche id par id.', error);
+  }
+}
+
+async function findCombination(productId: string, attributeValueId: string, reference?: string): Promise<string | null> {
+  const cacheKey = combinationValueKey(productId, attributeValueId);
+  const referenceKey = reference ? combinationReferenceKey(productId, reference) : '';
+  const cached = combinationIdByProductAndValueId.get(cacheKey)
+    || (referenceKey ? combinationIdByProductAndReference.get(referenceKey) : null);
+  if (cached) return cached;
+
+  await loadCombinationCache();
+
+  const loaded = combinationIdByProductAndValueId.get(cacheKey)
+    || (referenceKey ? combinationIdByProductAndReference.get(referenceKey) : null);
   if (loaded) return loaded;
 
   const ids = await getAllIds('combinations');
@@ -598,14 +956,67 @@ async function findCombination(productId: string, attributeValueId: string): Pro
     const xmlText = (await getOneXml('combinations', id)) as string;
     const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
     const idProduct = doc.querySelector('id_product')?.textContent?.trim();
+    const apiReference = doc.querySelector('reference')?.textContent?.trim() || '';
+    const defaultOn = doc.querySelector('default_on')?.textContent?.trim() || '';
     const values = Array.from(doc.querySelectorAll('associations product_option_values product_option_value id'))
       .map((node) => node.textContent?.trim());
-    if (idProduct === productId && values.includes(attributeValueId)) {
+    if (idProduct === productId && defaultOn === '1') productWithDefaultCombination.add(productId);
+    if (idProduct === productId && apiReference) {
+      combinationIdByProductAndReference.set(combinationReferenceKey(productId, apiReference), id);
+    }
+    if (idProduct === productId && (values.includes(attributeValueId) || (reference && normalize(apiReference) === normalize(reference)))) {
       combinationIdByProductAndValueId.set(cacheKey, id);
       return id;
     }
   }
   return null;
+}
+
+async function productHasDefaultCombination(productId: string): Promise<boolean> {
+  if (productWithDefaultCombination.has(productId)) return true;
+  await loadCombinationCache();
+  return productWithDefaultCombination.has(productId);
+}
+
+function hasInvalidSpecificPriceRule(data: Record<string, string>): boolean {
+  const reductionType = normalize(data.reduction_type || '');
+  const fromQuantity = Number(data.from_quantity || '0');
+
+  return !['amount', 'percentage'].includes(reductionType)
+    || !Number.isFinite(fromQuantity)
+    || fromQuantity < 1
+    || String(data.price ?? '').trim() === '';
+}
+
+async function cleanupInvalidSpecificPriceRules(): Promise<void> {
+  const rules = await loadFullResource('specific_price_rules');
+  const invalidRules = Array.from(rules)
+    .filter(([, data]) => hasInvalidSpecificPriceRule(data));
+
+  if (invalidRules.length === 0) return;
+
+  console.warn(
+    `Suppression de ${invalidRules.length} regle(s) de prix specifique invalide(s) ` +
+    'qui bloquaient la creation des declinaisons.',
+    invalidRules.map(([id, data]) => ({
+      id,
+      name: data.name || '',
+      price: data.price || '',
+      from_quantity: data.from_quantity || '',
+      reduction_type: data.reduction_type || '',
+    }))
+  );
+
+  for (const [id] of invalidRules) {
+    const ok = await deleteResource('specific_price_rules', id);
+    if (!ok) {
+      throw new Error(
+        `Regle de prix specifique invalide ${id} impossible a supprimer. ` +
+        'Elle provoque un crash PrestaShop pendant la creation des declinaisons.'
+      );
+    }
+    rules.delete(id);
+  }
 }
 
 export async function extractImagesFromZip(zipFile: File): Promise<Record<string, ImagePayload>> {
@@ -690,7 +1101,7 @@ export async function extractImagesFromZip(zipFile: File): Promise<Record<string
     };
   }
 
-  if (!Object.keys(images).length) throw new Error('Aucune image valide dans images.zip');
+  // Return empty object if no images found - import continues without images
   return images;
 }
 
@@ -719,6 +1130,10 @@ export async function importProduits(
   productsByReference.clear();
   combinationsByReferenceAndValue.clear();
   resetImportCaches();
+  
+  // ✅ OPTIMISATION: Précharger tous les caches en PARALLÈLE au début
+  console.log('📥 Préchargement des ressources en parallèle...');
+  const startPreload = performance.now();
   await Promise.all([
     loadFullResource('products'),
     loadFullResource('categories'),
@@ -726,6 +1141,7 @@ export async function importProduits(
     loadFullResource('tax_rule_groups'),
     loadFullResource('countries'),
   ]);
+  console.log(`✓ Préchargement terminé en ${Math.round(performance.now() - startPreload)}ms`);
 
   for (let i = 0; i < rows.length; i++) {
     const rowNumber = i + 2;
@@ -812,25 +1228,415 @@ export async function importImages(
   transaction.markStepSuccess('images');
 }
 
+async function validateCombinationBeforePost(
+  productId: string,
+  valueId: string,
+  reference: string,
+  rowNumber: number
+): Promise<void> {
+  // Vérifier que productId existe et est un nombre
+  if (!productId || !/^\d+$/.test(String(productId))) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: ID produit invalide "${productId}". ` +
+      `Vérifier que le produit a été créé au fichier 1.`
+    );
+  }
+
+  // Vérifier que valueId existe et est un nombre
+  if (!valueId || !/^\d+$/.test(String(valueId))) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: ID attribut invalide "${valueId}". ` +
+      `Vérifier que la valeur d'attribut a été créée correctement.`
+    );
+  }
+
+  // Vérifier que la référence n'est pas vide
+  if (!reference || !reference.trim()) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: référence vide pour combinaison. ` +
+      `Format attendu: REFERENCE-karazany`
+    );
+  }
+
+  // Vérifier que le produit existe et est en mode "combinations"
+  try {
+    const productXml = (await getOneXml('products', productId, { silent404: true })) as string | null;
+    if (!productXml) {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: produit ${productId} introuvable. ` +
+        `Vérifier que le produit a été créé au fichier 1 et importé correctement.`
+      );
+    }
+
+    const productDoc = new DOMParser().parseFromString(productXml, 'text/xml');
+    const productType = productDoc.querySelector('product_type')?.textContent?.trim();
+    
+    // CRITIQUE: le produit DOIT être en mode "combinations"
+    if (productType !== 'combinations') {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: ERREUR CRITIQUE - Produit ${productId} n'est PAS en mode "combinations". ` +
+        `Type actuel: "${productType}". ` +
+        `La tentative de changement de type a possiblement échoué. ` +
+        `Vérifier eval/var/logs/dev.log ou eval/var/logs/prod.log`
+      );
+    }
+    
+    console.log(`  ✓ Produit ${productId} est en mode "combinations"`);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('ERREUR CRITIQUE')) {
+      throw error; // Relancer l'erreur critique
+    }
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: impossible de vérifier le produit ${productId}. ` +
+      `Détails: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  // Vérifier que valueId existe dans product_option_values
+  try {
+    const valueXml = (await getOneXml('product_option_values', valueId, { silent404: true })) as string | null;
+    if (!valueXml) {
+      throw new Error(
+        `Fichier 2 ligne ${rowNumber}: valeur d'attribut ${valueId} introuvable. ` +
+        `Vérifier que la valeur a été créée correctement au fichier 2.`
+      );
+    }
+    console.log(`  ✓ Valeur d'attribut ${valueId} existe`);
+  } catch (error) {
+    throw new Error(
+      `Fichier 2 ligne ${rowNumber}: impossible de vérifier la valeur d'attribut ${valueId}. ` +
+      `Détails: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  console.log(`  ✓ Validation OK pour combinaison ${reference}`);
+}
+
+function buildCombinationXml(params: {
+  productId: string;
+  reference: string;
+  priceImpactHT: number;
+  valueId: string;
+  isDefault: boolean;
+}): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop xmlns:xlink="http://www.w3.org/1999/xlink">
+  <combination>
+    <id_product>${params.productId}</id_product>
+    <reference>${cdata(params.reference)}</reference>
+    <price>${params.priceImpactHT.toFixed(6)}</price>
+    <minimal_quantity>1</minimal_quantity>
+    <default_on>${params.isDefault ? 1 : 0}</default_on>
+    <associations>
+      <product_option_values>
+        <product_option_value>
+          <id>${params.valueId}</id>
+        </product_option_value>
+      </product_option_values>
+    </associations>
+  </combination>
+</prestashop>`;
+}
+
+async function repairCombinationAfterCrash(params: {
+  productId: string;
+  combinationId: string;
+  valueId: string;
+  priceImpactHT: number;
+  isDefault: boolean;
+}): Promise<void> {
+  try {
+    const response = await fetch('/newapp-api/prepare-import.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'repair-combination',
+        productId: params.productId,
+        combinationId: params.combinationId,
+        valueId: params.valueId,
+        priceImpactHT: params.priceImpactHT,
+        isDefault: params.isDefault,
+      }),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.success) {
+      throw new Error(result?.message || `HTTP ${response.status}`);
+    }
+    stockAvailableCacheLoaded = false;
+    combinationCacheLoaded = false;
+  } catch (error) {
+    console.warn(
+      `Réparation locale de la déclinaison ${params.combinationId} impossible:`,
+      error
+    );
+  }
+}
+
+async function createCombinationWithRecovery(params: {
+  productId: string;
+  reference: string;
+  priceImpactHT: number;
+  valueId: string;
+  isDefault: boolean;
+}): Promise<{ id: string; created: boolean }> {
+  const existingBefore = await findCombination(params.productId, params.valueId, params.reference);
+  if (existingBefore) {
+    await repairCombinationAfterCrash({
+      productId: params.productId,
+      combinationId: existingBefore,
+      valueId: params.valueId,
+      priceImpactHT: params.priceImpactHT,
+      isDefault: params.isDefault,
+    });
+    return { id: existingBefore, created: false };
+  }
+
+  // ✅ CRITIQUE: Vérifier que le produit est bien en mode "combinations" avant POST
+  // Les erreurs 500 vides = le produit n'est pas en mode "combinations" en BD
+  console.log(`\n  🔍 [COMBINAISON ${params.reference}] Diagnostic avant POST...`);
+  
+  const productXml = (await getOneXml('products', params.productId)) as string;
+  const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+  const productType = doc.querySelector('product_type')?.textContent?.trim();
+  
+  console.log(`  📊 État du produit ${params.productId}:`);
+  console.log(`    - reference: ${doc.querySelector('reference')?.textContent?.trim()}`);
+  console.log(`    - type: "${productType}"`);
+  console.log(`    - active: ${doc.querySelector('active')?.textContent?.trim()}`);
+  console.log(`    - id_tax_rules_group: ${doc.querySelector('id_tax_rules_group')?.textContent?.trim()}`);
+  
+  if (productType !== 'combinations') {
+    console.error(`  ❌ ERREUR BLOCANTE: Produit ${params.productId} n'est PAS en mode "combinations"`);
+    console.error(`    Type actuel: "${productType}"`);
+    console.error(`    Cela va CAUSER une erreur HTTP 500`);
+    console.error(`    XML complet du produit:`);
+    console.error(productXml);
+    
+    console.error(`  🔴 TENTATIVE DE SAUVETAGE: Changement de type une fois de plus...`);
+    try {
+      const doc2 = new DOMParser().parseFromString(productXml, 'text/xml');
+      removeNotWritableFields(doc2);
+      setFirstTag(doc2, 'product_type', 'combinations');
+      const xml2 = new XMLSerializer().serializeToString(doc2);
+      const ok = await putXML('products', params.productId, xml2);
+      
+      if (!ok) {
+        throw new Error('PUT retourné false');
+      }
+      
+      console.error(`    ⏳ Attente 3000ms pour synchronisation...`);
+      await wait(3000);
+      
+      const verify2Xml = (await getOneXml('products', params.productId)) as string;
+      const verify2Doc = new DOMParser().parseFromString(verify2Xml, 'text/xml');
+      const type2 = verify2Doc.querySelector('product_type')?.textContent?.trim();
+      
+      if (type2 !== 'combinations') {
+        throw new Error(`Type toujours "${type2}" après nouvelle tentative`);
+      }
+      console.error(`    ✅ Type corrigé! Relance création combinaison...`);
+    } catch (retryError) {
+      throw new Error(
+        `[PRODUIT ${params.productId}] IMPOSSIBLE DE CRÉER COMBINAISON: ` +
+        `Le produit n'est pas en mode "combinations" (type="${productType}"). ` +
+        `Tentative de sauvetage échouée: ${retryError instanceof Error ? retryError.message : String(retryError)}. ` +
+        `Vérifier eval/var/logs/dev.log`
+      );
+    }
+  }
+  
+  console.log(`  ✅ Produit ${params.productId} confirmé en mode "combinations". Création de combinaison...`);
+  
+  // ✅ Attendre avant de créer la combinaison
+  await wait(500);
+
+  const firstXml = buildCombinationXml(params);
+  const firstResult = (await postXML('combinations', firstXml)) as unknown as CreatedResponse;
+  if (firstResult.success && firstResult.id) {
+    const id = String(firstResult.id);
+    combinationIdByProductAndValueId.set(combinationValueKey(params.productId, params.valueId), id);
+    combinationIdByProductAndReference.set(combinationReferenceKey(params.productId, params.reference), id);
+    if (params.isDefault) productWithDefaultCombination.add(params.productId);
+    return { id, created: true };
+  }
+
+  // PrestaShop peut insérer la combinaison puis crasher avant de répondre.
+  // On recharge donc le cache avant de considérer la création comme échouée.
+  await wait(300);
+  await loadCombinationCache(true);
+  const existingAfterCrash = await findCombination(params.productId, params.valueId, params.reference);
+  if (existingAfterCrash) {
+    await repairCombinationAfterCrash({
+      productId: params.productId,
+      combinationId: existingAfterCrash,
+      valueId: params.valueId,
+      priceImpactHT: params.priceImpactHT,
+      isDefault: params.isDefault,
+    });
+    return { id: existingAfterCrash, created: false };
+  }
+
+  if (params.isDefault) {
+    const retryXml = buildCombinationXml({ ...params, isDefault: false });
+    const retryResult = (await postXML('combinations', retryXml)) as unknown as CreatedResponse;
+    if (retryResult.success && retryResult.id) {
+      const id = String(retryResult.id);
+      combinationIdByProductAndValueId.set(combinationValueKey(params.productId, params.valueId), id);
+      combinationIdByProductAndReference.set(combinationReferenceKey(params.productId, params.reference), id);
+      return { id, created: true };
+    }
+
+    await wait(300);
+    await loadCombinationCache(true);
+    const existingAfterRetry = await findCombination(params.productId, params.valueId, params.reference);
+    if (existingAfterRetry) {
+      await repairCombinationAfterCrash({
+        productId: params.productId,
+        combinationId: existingAfterRetry,
+        valueId: params.valueId,
+        priceImpactHT: params.priceImpactHT,
+        isDefault: false,
+      });
+      return { id: existingAfterRetry, created: false };
+    }
+
+    throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${retryResult.error || firstResult.error || 'HTTP 500'})`);
+  }
+
+  throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${firstResult.error || 'HTTP 500'})`);
+}
+
+// ✅ Interface pour collecter les mises à jour de stock (batch à la fin)
+interface StockUpdateBatch {
+  productId: string;
+  combinationId: string;
+  quantity: number;
+  skipIfAlreadyExists: boolean;
+}
+
+// ✅ Traiter une seule déclinaison (prêt pour la parallélisation)
+async function processSingleDeclinaison(
+  row: string[],
+  rowNumber: number,
+  headers: string[],
+  transaction: ImportTransaction,
+  defaultCombinationCreatedByProduct: Set<string>,
+  stockUpdates: StockUpdateBatch[]
+): Promise<void> {
+  const reference = getColumnValue(headers, row, 'reference');
+  const specificite = getColumnValue(headers, row, 'specificite');
+  const karazany = getColumnValue(headers, row, 'karazany');
+  const stockInitial = parseInt(getColumnValue(headers, row, 'stock_initial'), 10);
+  const priceTTCValue = getColumnValue(headers, row, 'prix_vente_ttc');
+
+  if (!reference || Number.isNaN(stockInitial)) {
+    throw new Error(`Fichier 2 ligne ${rowNumber}: reference et stock_initial sont requis`);
+  }
+
+  const product = productsByReference.get(normalize(reference));
+  if (!product) throw new Error(`Fichier 2 ligne ${rowNumber}: produit ${reference} absent du fichier 1`);
+
+  if (!specificite && !karazany) {
+    stockUpdates.push({
+      productId: product.id,
+      combinationId: '0',
+      quantity: stockInitial,
+      skipIfAlreadyExists: false,
+    });
+    return;
+  }
+
+  if (!specificite || !karazany) {
+    throw new Error(`Fichier 2 ligne ${rowNumber}: specificite et karazany doivent etre remplis ensemble`);
+  }
+
+  // ✅ updateProductTypeToCombinations a un cache, pas de redondance même en parallèle
+  const groupId = await ensureProductOption(specificite, transaction);
+  const valueId = await ensureProductOptionValue(groupId, karazany, transaction);
+  const priceTTC = priceTTCValue ? parseNumber(priceTTCValue) : product.priceTTC;
+  const priceImpactHT = (priceTTC - product.priceTTC) / (1 + product.taxRate);
+
+  const combinationReference = `${reference}-${karazany}`;
+  let combinationId = await findCombination(product.id, valueId, combinationReference);
+  let createdCombination = false;
+
+  if (!combinationId) {
+    const isDefault = !defaultCombinationCreatedByProduct.has(product.id)
+      && !(await productHasDefaultCombination(product.id));
+
+    await validateCombinationBeforePost(product.id, valueId, combinationReference, rowNumber);
+
+    const created = await createCombinationWithRecovery({
+      productId: product.id,
+      reference: combinationReference,
+      priceImpactHT,
+      valueId,
+      isDefault,
+    });
+    combinationId = created.id;
+
+    if (created.created) transaction.trackResource('fichier2', 'combinations', combinationId);
+    combinationIdByProductAndValueId.set(combinationValueKey(product.id, valueId), combinationId);
+    combinationIdByProductAndReference.set(combinationReferenceKey(product.id, combinationReference), combinationId);
+    stockAvailableCacheLoaded = false;
+    combinationCacheLoaded = false;
+    createdCombination = created.created;
+  }
+
+  defaultCombinationCreatedByProduct.add(product.id);
+
+  // ✅ Collecter pour batch à la fin au lieu d'appeler immédiatement
+  stockUpdates.push({
+    productId: product.id,
+    combinationId,
+    quantity: stockInitial,
+    skipIfAlreadyExists: !createdCombination,
+  });
+
+  combinationsByReferenceAndValue.set(combinationKey(reference, karazany), {
+    id: combinationId,
+    productId: product.id,
+    reference,
+    karazany,
+    priceHT: product.priceHT + priceImpactHT,
+    priceTTC,
+  });
+}
+
 export async function importDeclinaisons(
   rows: string[][],
   headers: string[],
   transaction: ImportTransaction
 ): Promise<void> {
+  // ✅ CRITICAL: Réinitialiser les caches au début de fichier 2
+  // combinationCacheLoaded et stockAvailableCacheLoaded doivent être false pour recharger depuis API
+  // ✅ CRITICAL: Réinitialiser productsMarkedAsCombinations pour forcer le re-check du product_type
+  // Sans cela, lors du 2e import, on retourne immédiatement sans vérifier si le changement "a tenu"
+  combinationCacheLoaded = false;
+  stockAvailableCacheLoaded = false;
+  productsMarkedAsCombinations.clear();
+  
   transaction.registerStep('fichier2');
+  const startTime = performance.now();
+  
+  await cleanupInvalidSpecificPriceRules();
   await Promise.all([
     loadFullResource('product_options'),
     loadFullResource('product_option_values'),
   ]);
 
-  for (let i = 0; i < rows.length; i++) {
-    const rowNumber = i + 2;
-    const row = rows[i];
+  const defaultCombinationCreatedByProduct = new Set<string>();
+  const stockUpdates: StockUpdateBatch[] = [];
+  
+  // ✅ ÉTAPE 1: Identifier les produits qui ont besoin d'être mis à jour en mode "combinations"
+  const productsToUpdateType = new Set<string>();
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const rowNumber = index + 2;
     const reference = getColumnValue(headers, row, 'reference');
     const specificite = getColumnValue(headers, row, 'specificite');
     const karazany = getColumnValue(headers, row, 'karazany');
     const stockInitial = parseInt(getColumnValue(headers, row, 'stock_initial'), 10);
-    const priceTTCValue = getColumnValue(headers, row, 'prix_vente_ttc');
 
     if (!reference || Number.isNaN(stockInitial)) {
       throw new Error(`Fichier 2 ligne ${rowNumber}: reference et stock_initial sont requis`);
@@ -839,59 +1645,79 @@ export async function importDeclinaisons(
     const product = productsByReference.get(normalize(reference));
     if (!product) throw new Error(`Fichier 2 ligne ${rowNumber}: produit ${reference} absent du fichier 1`);
 
-    if (!specificite && !karazany) {
-      await updateStock(transaction, 'fichier2', product.id, '0', stockInitial);
-      continue;
+    if (specificite && karazany) {
+      productsToUpdateType.add(product.id);
     }
-
-    if (!specificite || !karazany) {
-      throw new Error(`Fichier 2 ligne ${rowNumber}: specificite et karazany doivent etre remplis ensemble`);
-    }
-
-    const groupId = await ensureProductOption(specificite, transaction);
-    const valueId = await ensureProductOptionValue(groupId, karazany, transaction);
-    const priceTTC = priceTTCValue ? parseNumber(priceTTCValue) : product.priceTTC;
-    const priceImpactHT = (priceTTC - product.priceTTC) / (1 + product.taxRate);
-
-    let combinationId = await findCombination(product.id, valueId);
-    let createdCombination = false;
-    if (!combinationId) {
-      combinationId = await postRequired(
-        'combinations',
-        `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <combination>
-    <id_product>${product.id}</id_product>
-    <reference>${cdata(`${reference}-${karazany}`)}</reference>
-    <price>${priceImpactHT.toFixed(6)}</price>
-    <minimal_quantity>1</minimal_quantity>
-    <default_on>0</default_on>
-    <associations>
-      <product_option_values>
-        <product_option_value><id>${valueId}</id></product_option_value>
-      </product_option_values>
-    </associations>
-  </combination>
-</prestashop>`,
-        `Declinaison ${reference}/${karazany}`
-      );
-      transaction.trackResource('fichier2', 'combinations', combinationId);
-      combinationIdByProductAndValueId.set(combinationValueKey(product.id, valueId), combinationId);
-      stockAvailableCacheLoaded = false;
-      createdCombination = true;
-    }
-
-    await updateStock(transaction, 'fichier2', product.id, combinationId, stockInitial, !createdCombination);
-    combinationsByReferenceAndValue.set(combinationKey(reference, karazany), {
-      id: combinationId,
-      productId: product.id,
-      reference,
-      karazany,
-      priceHT: product.priceHT + priceImpactHT,
-      priceTTC,
-    });
   }
 
+  // ✅ ÉTAPE 2: Mettre à jour le type pour TOUS les produits SÉQUENTIELLEMENT pour éviter les race conditions
+  if (productsToUpdateType.size > 0) {
+    const productArray = Array.from(productsToUpdateType);
+    console.log(`\n⚡ ÉTAPE 2: Changement du type pour ${productArray.length} produits...`);
+    for (let i = 0; i < productArray.length; i += 1) {
+      const productId = productArray[i];
+      console.log(`\n[${i + 1}/${productArray.length}] Traitement du produit ${productId}...`);
+      try {
+        await updateProductTypeToCombinations(productId, transaction);
+        console.log(`[${i + 1}/${productArray.length}] ✅ Produit ${productId} OK`);
+      } catch (error) {
+        console.error(`[${i + 1}/${productArray.length}] ❌ Produit ${productId} ÉCHOUÉ:`, error);
+        throw error;
+      }
+      // Petit délai entre chaque produit pour éviter les contentions BD
+      await wait(500);
+    }
+    console.log(`\n✅ ÉTAPE 2 COMPLÉTÉE: Tous les types changés avec succès`);
+  }
+
+  // ✅ ÉTAPE 3: Traiter les déclinaisons en ordre stable pour ne créer
+  // qu'une seule déclinaison par défaut par produit.
+  console.log(`⚡ Traitement de ${rows.length} déclinaisons en ordre stable...`);
+  const rowsWithIndex = rows.map((row, index) => ({ row, index }));
+  
+  await processInBatches(
+    rowsWithIndex,
+    100, // batch size
+    async (item) => {
+      await processSingleDeclinaison(
+        item.row,
+        item.index + 2,
+        headers,
+        transaction,
+        defaultCombinationCreatedByProduct,
+        stockUpdates
+      );
+    },
+    1
+  );
+
+  // ✅ ÉTAPE 4: Appliquer toutes les mises à jour de stock en batch
+  if (stockUpdates.length > 0) {
+    console.log(`⚡ Application de ${stockUpdates.length} mises à jour de stock en batch (max 5 concurrent)...`);
+    await processInBatches(
+      stockUpdates,
+      50,
+      async (update) => {
+        await updateStock(
+          transaction,
+          'fichier2',
+          update.productId,
+          update.combinationId,
+          update.quantity,
+          update.skipIfAlreadyExists
+        );
+      },
+      5
+    );
+  }
+
+  const endTime = performance.now();
+  console.log(`✅ Fichier 2 traité en ${((endTime - startTime) / 1000).toFixed(2)}s`);
+  
+  // ✅ CRITICAL: Réinitialiser le cache des stocks avant le fichier 3
+  // Sinon les stocks créés en fichier 2 ne seront pas visibles en fichier 3
+  resetStockCache();
+  
   transaction.markStepSuccess('fichier2');
 }
 
@@ -907,13 +1733,18 @@ async function getDefaultCarrierId(): Promise<string> {
 }
 
 async function ensureCustomer(email: string, name: string, password: string, date: string, transaction: ImportTransaction): Promise<{ id: string; secureKey: string }> {
-  const existing = await findRecordByField('customers', 'email', email);
-  let id = existing?.id || null;
-  let data = existing?.data || null;
-  if (!id) {
-    id = await postRequired(
-      'customers',
-      `<?xml version="1.0" encoding="UTF-8"?>
+  const cacheKey = normalize(email);
+  const inflight = customerInflight.get(cacheKey);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const existing = await findRecordByField('customers', 'email', email);
+    let id = existing?.id || null;
+    let data = existing?.data || null;
+    if (!id) {
+      id = await postRequired(
+        'customers',
+        `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <customer>
     <id_default_group>${DEFAULT_CUSTOMER_GROUP}</id_default_group>
@@ -931,14 +1762,22 @@ async function ensureCustomer(email: string, name: string, password: string, dat
     <associations><groups><group><id>${DEFAULT_CUSTOMER_GROUP}</id></group></groups></associations>
   </customer>
 </prestashop>`,
-      `Client ${email}`
-    );
-    transaction.trackResource('fichier3', 'customers', id);
-    data = (await getOne('customers', id)) as unknown as Record<string, string>;
-    cacheResource('customers', id, data);
-  }
+        `Client ${email}`
+      );
+      transaction.trackResource('fichier3', 'customers', id);
+      data = (await getOne('customers', id)) as unknown as Record<string, string>;
+      cacheResource('customers', id, data);
+    }
 
-  return { id, secureKey: data?.secure_key || '-1' };
+    return { id, secureKey: data?.secure_key || '-1' };
+  })();
+
+  customerInflight.set(cacheKey, promise);
+  try {
+    return await promise;
+  } finally {
+    customerInflight.delete(cacheKey);
+  }
 }
 
 function resolveCartItem(item: { reference: string; quantite: number; karazany: string }) {
@@ -967,30 +1806,145 @@ function resolveCartItem(item: { reference: string; quantite: number; karazany: 
   };
 }
 
+function resolveImportOrderState(rawState: string, rowNumber: number): string | null {
+  const state = normalize(rawState);
+  if (!state) return null;
+  
+  if (state === 'paiement accepte' || state === 'paiement effectue') {
+    return ORDER_STATE_PAID;
+  }
+  if (state === 'livre') return ORDER_STATE_DELIVERED;
+  if (state === 'annule') return ORDER_STATE_CANCELLED;
+
+  throw new Error(
+    `Fichier 3 ligne ${rowNumber}: etat invalide "${rawState}". ` +
+    'Valeurs acceptees: vide, paiement accepte, paiement effectue, livre, annule'
+  );
+}
+
+async function createOrderPayment(
+  orderId: string,
+  totalPaid: string,
+  date: string,
+  transaction: ImportTransaction
+): Promise<void> {
+  const orderData = (await getOne('orders', orderId)) as unknown as Record<string, string>;
+  const reference = orderData.reference || '';
+  if (!reference) return;
+
+  const paymentId = await postRequired(
+    'order_payments',
+    `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop>
+  <order_payment>
+    <order_reference>${cdata(reference)}</order_reference>
+    <id_currency>${ID_CURRENCY}</id_currency>
+    <amount>${totalPaid}</amount>
+    <payment><![CDATA[Cash on delivery]]></payment>
+    <conversion_rate>1.000000</conversion_rate>
+    <date_add>${date}</date_add>
+  </order_payment>
+</prestashop>`,
+    `Paiement commande ${orderId}`
+  );
+  transaction.trackResource('fichier3', 'order_payments', paymentId);
+}
+
+async function readStockQuantity(productId: string, combinationId: string): Promise<number> {
+  const stockId = await findStockAvailableId(productId, combinationId);
+  if (!stockId) return 0;
+
+  const cached = getCachedResource('stock_availables', stockId);
+  let quantity = Number(cached?.quantity ?? NaN);
+  if (!Number.isFinite(quantity)) {
+    const stockXml = (await getOneXml('stock_availables', stockId)) as string;
+    const stockDoc = new DOMParser().parseFromString(stockXml, 'text/xml');
+    quantity = Number(stockDoc.querySelector('quantity')?.textContent?.trim() || '0');
+  }
+
+  return Number.isFinite(quantity) ? quantity : 0;
+}
+
+async function validateOrderStockBeforeImport(rows: string[][], headers: string[]): Promise<void> {
+  const simulatedStock = new Map<string, number>();
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const rowNumber = index + 2;
+    const items = parseAchat(getColumnValue(headers, rows[index], 'achat'));
+    const orderStateId = resolveImportOrderState(getColumnValue(headers, rows[index], 'etat'), rowNumber);
+
+    if (orderStateId === null) {
+      continue;
+    }
+
+    const resolved = items.map(resolveCartItem);
+    const touched: Array<{ key: string; quantity: number }> = [];
+
+    for (let itemIndex = 0; itemIndex < resolved.length; itemIndex += 1) {
+      const entry = resolved[itemIndex];
+      const item = items[itemIndex];
+      const key = stockKey(entry.product.id, entry.combinationId);
+
+      if (!simulatedStock.has(key)) {
+        simulatedStock.set(key, await readStockQuantity(entry.product.id, entry.combinationId));
+      }
+
+      const currentQuantity = simulatedStock.get(key) ?? 0;
+      const nextQuantity = currentQuantity - item.quantite;
+      if (nextQuantity < 0) {
+        throw new Error(
+          `Fichier 3 ligne ${rowNumber}: stock insuffisant pour ${item.reference}/${item.karazany || 'simple'} ` +
+          `(stock disponible avant commande: ${currentQuantity}, quantite demandee: ${item.quantite})`
+        );
+      }
+
+      simulatedStock.set(key, nextQuantity);
+      touched.push({ key, quantity: item.quantite });
+    }
+
+    if (orderStateId === ORDER_STATE_CANCELLED) {
+      for (const movement of touched) {
+        simulatedStock.set(movement.key, (simulatedStock.get(movement.key) ?? 0) + movement.quantity);
+      }
+    }
+  }
+}
+
 export async function importCommandes(
   rows: string[][],
   headers: string[],
   transaction: ImportTransaction
 ): Promise<void> {
   transaction.registerStep('fichier3');
+  
+  // ✅ CRITICAL: Réinitialiser le cache spécialisé des stocks avant toute validation
+  // Cela force le rechargement depuis la DB via loadAllStockAvailables()
+  resetStockCache();
+  
+  // ✅ OPTIMISATION: Précharger tous les caches en PARALLÈLE au début
+  console.log('📥 Préchargement des ressources fichier3 en parallèle...');
+  const startPreload = performance.now();
   await Promise.all([
     loadFullResource('customers'),
     loadFullResource('carriers'),
     loadFullResource('countries'),
-  ]);
-
-  const orderStateMap: Record<string, string> = {
-    'en attente paiement a la livraison': '13',
-    'paiement accepte': '2',
-    'erreur de paiement': '8',
-  };
+    loadFullResource('stock_availables'), // ✅ CRITIQUE: recharger les stocks du fichier 2
+  ]).catch(err => {
+    // Si stock_availables échoue, ce n'est pas bloquant - updateStock() les créera
+    console.warn('⚠️ Préchargement des stocks échoué (non critique):', err);
+  });
+  console.log(`✓ Préchargement fichier3 terminé en ${Math.round(performance.now() - startPreload)}ms`);
+  
+  // ✅ Track des ordres créées pour corriger les dates après
+  const ordersToFixDates: Array<{ id: string; date: string }> = [];
 
   const carrierId = await getDefaultCarrierId();
   const countryId = await getDefaultCountryId();
 
-  for (let i = 0; i < rows.length; i++) {
-    const rowNumber = i + 2;
-    const row = rows[i];
+  await validateOrderStockBeforeImport(rows, headers);
+
+  await processInBatches(rows, 4, async (row, index) => {
+    const rowNumber = index + 2;
     const date = parseDate(getColumnValue(headers, row, 'date'));
     const name = getColumnValue(headers, row, 'nom');
     const email = getColumnValue(headers, row, 'email');
@@ -998,7 +1952,7 @@ export async function importCommandes(
     const address = getColumnValue(headers, row, 'adresse');
     const items = parseAchat(getColumnValue(headers, row, 'achat'));
     const stateRaw = getColumnValue(headers, row, 'etat');
-    const stateKey = normalize(stateRaw);
+    const orderStateId = resolveImportOrderState(stateRaw, rowNumber);
 
     if (!name || !email || !password || !address || items.length === 0) {
       throw new Error(`Fichier 3 ligne ${rowNumber}: nom, email, pwd, adresse et achat sont requis`);
@@ -1066,12 +2020,11 @@ export async function importCommandes(
     );
     transaction.trackResource('fichier3', 'carts', cartId);
 
-    if (!stateRaw.trim()) {
-      continue;
+    // Check if state indicates cart-only (no order)
+    const isCartOnly = orderStateId === null;
+    if (isCartOnly) {
+      return;
     }
-
-    const orderStateId = orderStateMap[stateKey];
-    if (!orderStateId) throw new Error(`Fichier 3 ligne ${rowNumber}: etat inconnu "${stateRaw}"`);
 
     const totalHT = resolved.reduce((sum, entry, index) => sum + entry.unitHT * items[index].quantite, 0);
     const totalTTC = resolved.reduce((sum, entry, index) => sum + entry.unitTTC * items[index].quantite, 0);
@@ -1137,10 +2090,12 @@ export async function importCommandes(
       `Commande ${email}`
     );
     transaction.trackResource('fichier3', 'orders', orderId);
+    
+    // ✅ Tracker l'ordre pour corriger la date après (PrestaShop ignore les dates via l'API)
+    ordersToFixDates.push({ id: orderId, date });
 
-    if (orderStateId !== INITIAL_ORDER_STATE) {
-      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'current_state', orderStateId, false);
-      await updateResourceField(transaction, 'fichier3', 'orders', orderId, 'valid', orderStateId === '2' ? 1 : 0, false);
+    if (isPaidLikeOrderState(orderStateId)) {
+      await createOrderPayment(orderId, totalPaid, date, transaction);
     }
 
     const historyId = await postRequired(
@@ -1157,6 +2112,32 @@ export async function importCommandes(
       `Historique commande ${orderId}`
     );
     transaction.trackResource('fichier3', 'order_histories', historyId);
+  }, 1);
+
+  // ✅ Corriger les dates des ordres via l'API PrestaShop directement (plus de PHP requis)
+  if (ordersToFixDates.length > 0) {
+    console.log(`⚡ Correction des dates pour ${ordersToFixDates.length} commandes via l'API PrestaShop...`);
+    let fixed = 0;
+    let failed = 0;
+    await processInBatches(ordersToFixDates, 10, async ({ id, date }) => {
+      try {
+        const orderXml = (await getOneXml('orders', id)) as string;
+        if (!orderXml) { failed++; return; }
+        const doc = new DOMParser().parseFromString(orderXml, 'text/xml');
+        removeNotWritableFields(doc);
+        const dateAddEl = doc.querySelector('date_add');
+        const dateUpdEl = doc.querySelector('date_upd');
+        if (dateAddEl) dateAddEl.textContent = date;
+        if (dateUpdEl) dateUpdEl.textContent = date;
+        const updatedXml = new XMLSerializer().serializeToString(doc);
+        const ok = await putXML('orders', id, updatedXml);
+        if (ok) { fixed++; } else { failed++; console.warn(`⚠️ Impossible de corriger la date de la commande ${id}`); }
+      } catch (err) {
+        failed++;
+        console.warn(`⚠️ Erreur correction date commande ${id}:`, err);
+      }
+    }, 3);
+    console.log(`✅ Dates commandes: ${fixed} corrigées, ${failed} ignorées (non bloquant)`);
   }
 
   transaction.markStepSuccess('fichier3');

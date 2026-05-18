@@ -2,13 +2,41 @@
   <div class="home">
 
     <!-- Filtre par catégories -->
-    <div class="category-filter">
-      <select id="category-select" v-model="selectedCategoryId" class="category-select">
-        <option value="">Tous les produits</option>
-        <option v-for="category in categories" :key="category.id" :value="category.id">
-          {{ category.name }}
-        </option>
-      </select>
+    <div class="product-search">
+      <div class="product-search__field product-search__field--wide">
+        <label for="product-name">Nom du produit</label>
+        <input
+          id="product-name"
+          v-model.trim="searchName"
+          class="search-input"
+          type="search"
+          placeholder="Rechercher..."
+        />
+      </div>
+
+      <div class="product-search__field">
+        <label for="category-select">Categorie</label>
+        <select id="category-select" v-model="selectedCategoryId" class="search-input">
+          <option value="">Toutes</option>
+          <option v-for="category in categories" :key="category.id" :value="category.id">
+            {{ category.name }}
+          </option>
+        </select>
+      </div>
+
+      <div class="product-search__field">
+        <label for="min-price">Prix min</label>
+        <input id="min-price" v-model.number="minPrice" class="search-input" type="number" min="0" step="0.01" />
+      </div>
+
+      <div class="product-search__field">
+        <label for="max-price">Prix max</label>
+        <input id="max-price" v-model.number="maxPrice" class="search-input" type="number" min="0" step="0.01" />
+      </div>
+
+      <button class="clear-filters" type="button" @click="clearFilters">
+        Effacer
+      </button>
     </div>
 
     <!-- État : chargement initial (avant le premier produit) -->
@@ -23,7 +51,7 @@
 
     <!-- État : aucun produit après chargement complet -->
     <div v-else-if="loadingState === 'success' && filteredProducts.length === 0">
-      Aucun produit disponible.
+      Aucun produit ne correspond aux criteres.
     </div>
 
     <!--
@@ -59,16 +87,40 @@ import type { Product, LoadingState, Category } from '../types/product.types'
 const products = ref<Product[]>([])
 const categories = ref<Category[]>([])
 const selectedCategoryId = ref<string>('')
+const searchName = ref<string>('')
+const minPrice = ref<number | null>(null)
+const maxPrice = ref<number | null>(null)
 const loadingState = ref<LoadingState>('idle')
 
 // ─── Produits filtrés par catégorie ──────────────────────────────────────────
 
 const filteredProducts = computed(() => {
-  if (!selectedCategoryId.value) {
-    return products.value
-  }
-  return products.value.filter(p => p.category_ids.includes(selectedCategoryId.value))
+  const query = normalize(searchName.value)
+  const min = Number(minPrice.value)
+  const max = Number(maxPrice.value)
+  const hasMin = minPrice.value !== null && minPrice.value !== undefined && !Number.isNaN(min)
+  const hasMax = maxPrice.value !== null && maxPrice.value !== undefined && !Number.isNaN(max)
+
+  // Chaque critere est optionnel. Un produit doit seulement respecter les criteres remplis.
+  return products.value.filter(product => {
+    const matchName = !query || normalize(product.name).includes(query)
+    const matchCategory = !selectedCategoryId.value || product.category_ids.includes(selectedCategoryId.value)
+    const matchMin = !hasMin || product.priceTTC >= min
+    const matchMax = !hasMax || product.priceTTC <= max
+    return matchName && matchCategory && matchMin && matchMax
+  })
 })
+
+function normalize(value: string): string {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+}
+
+function clearFilters(): void {
+  searchName.value = ''
+  selectedCategoryId.value = ''
+  minPrice.value = null
+  maxPrice.value = null
+}
 
 // ─── Chargement des catégories ──────────────────────────────────────────────
 
@@ -118,35 +170,50 @@ onMounted(async () => {
   padding: 1rem;
 }
 
-.category-filter {
+.product-search {
   margin-bottom: 2rem;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
+  display: grid;
+  grid-template-columns: minmax(180px, 1.25fr) minmax(160px, 1fr) minmax(110px, 0.65fr) minmax(110px, 0.65fr) minmax(88px, auto);
+  align-items: end;
+  gap: 0.75rem;
 }
 
-.category-filter label {
+.product-search__field {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.product-search__field label {
   font-weight: 600;
   color: #333;
+  font-size: 0.85rem;
 }
 
-.category-select {
+.search-input {
   padding: 0.5rem;
   border: 1px solid #ddd;
   border-radius: 4px;
   font-size: 1rem;
-  cursor: pointer;
-  min-width: 200px;
+  min-width: 0;
 }
 
-.category-select:hover {
+.search-input:hover {
   border-color: #999;
 }
 
-.category-select:focus {
+.search-input:focus {
   outline: none;
   border-color: #0066cc;
   box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.1);
+}
+
+.clear-filters {
+  border: 0;
+  border-radius: 4px;
+  background: #111827;
+  color: #fff;
+  cursor: pointer;
+  padding: 0.6rem 0.85rem;
 }
 
 .products-grid {
@@ -160,5 +227,21 @@ onMounted(async () => {
   padding: 1rem;
   color: #888;
   font-size: 0.9rem;
+}
+
+@media (max-width: 720px) {
+  .product-search {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .clear-filters {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 560px) {
+  .product-search {
+    grid-template-columns: 1fr;
+  }
 }
 </style>
