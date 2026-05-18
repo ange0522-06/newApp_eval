@@ -10,6 +10,7 @@ import { API_CONFIG } from '../../BackOffice/config/config';
 
 const BASE_URL = API_CONFIG.BASE_URL;
 const DEBUG_API = false;
+const DEFAULT_PAGE_SIZE = 250;
 
 function debugLog(...args) {
   if (DEBUG_API) console.log(...args);
@@ -130,39 +131,54 @@ export async function getAllIds(resource) {
   }
 }
 
+function buildListUrl(resource, display, offset, limit) {
+  return `${BASE_URL}/${resource}?display=${display}&limit=${offset},${limit}`;
+}
+
+function readResourceNodes(xmlText, resource) {
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+
+  if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
+    console.error(`Erreur de parsing XML pour ${resource}:`, xmlDoc);
+    return [];
+  }
+
+  const singular = singularResourceName(resource);
+  const container = xmlDoc.querySelector(resource);
+  return container
+    ? Array.from(container.children).filter(child => child.tagName === singular)
+    : Array.from(xmlDoc.querySelectorAll(singular));
+}
+
 /**
- * Recupere une ressource complete avec display=full en un seul appel.
- * Utile pour eviter le schema lent getAllIds() puis getOne() sur chaque ID.
+ * Recupere une ressource par pages. Passer un display cible comme
+ * "[id,name]" evite les reponses display=full trop lourdes.
  */
-export async function getFullResource(resource) {
+export async function getFullResource(resource, display = 'full', options = {}) {
   try {
-    const response = await fetch(`${BASE_URL}/${resource}?display=full`, {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'text/xml'
+    const pageSize = options.pageSize || DEFAULT_PAGE_SIZE;
+    const result = [];
+
+    for (let offset = 0; ; offset += pageSize) {
+      const response = await fetch(buildListUrl(resource, display, offset, pageSize), {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'text/xml'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const nodes = readResourceNodes(await response.text(), resource);
+      result.push(...nodes.map(readResourceNode).filter(item => item.id));
+
+      if (nodes.length < pageSize) break;
     }
 
-    const xmlText = await response.text();
-    const parser = new DOMParser();
-    const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
-
-    if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
-      console.error(`Erreur de parsing XML pour ${resource}:`, xmlDoc);
-      return [];
-    }
-
-    const singular = singularResourceName(resource);
-    const container = xmlDoc.querySelector(resource);
-    const nodes = container
-      ? Array.from(container.children).filter(child => child.tagName === singular)
-      : Array.from(xmlDoc.querySelectorAll(singular));
-
-    return nodes.map(readResourceNode).filter(item => item.id);
+    return result;
   } catch (error) {
     console.error(`Erreur getFullResource(${resource}):`, error);
     throw error;

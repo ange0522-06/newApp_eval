@@ -68,6 +68,7 @@ import {
   importCommandes,
 } from '../services/import.service';
 import { ImportTransaction } from '../services/transactionManager';
+import { getFullResource, putXML } from '../../shared/services/prestashop.service.js';
 
 const file1 = ref<File | null>(null);
 const file2 = ref<File | null>(null);
@@ -193,16 +194,83 @@ function clearFiles(): void {
 }
 
 async function prepareImportEnvironment(): Promise<void> {
-  const response = await fetch('/newapp-api/prepare-import.php', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
-  const data = await response.json().catch(() => null);
-  if (!response.ok || !data?.success) {
-    throw new Error(data?.message || `Preparation import impossible: HTTP ${response.status}`);
+  try {
+    const response = await fetch('/newapp-api/prepare-import.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'prepare' }),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.success) {
+      throw new Error(result?.message || `HTTP ${response.status}`);
+    }
+    const skipped = result.details?.skipped || [];
+    if (skipped.length > 0) {
+      console.warn('Preparation import: avertissements non bloquants', skipped);
+    }
+    console.log('Preparation import terminee:', result.details || {});
+  } catch (err) {
+    console.warn('Preparation import indisponible, import poursuivi:', err);
   }
+}
+
+/**
+ * Prépare l'environnement PrestaShop pour l'import (sans PHP).
+ * Désactive le SSL et reconfigure les URLs de la boutique via l'API XML.
+ */
+async function prepareImportEnvironmentLegacy(): Promise<void> {
+  const updated: string[] = [];
+  const skipped: string[] = [];
+
+  // 1. Désactiver SSL dans configurations
+  for (const configName of ['PS_SSL_ENABLED', 'PS_SSL_ENABLED_EVERYWHERE']) {
+    try {
+      const configs: any[] = await getFullResource('configurations');
+      const match = configs.find((c: any) => c.name === configName);
+      if (match) {
+        const ok = await putXML('configurations', match.id, `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop><configuration>
+  <id>${match.id}</id>
+  <name>${configName}</name>
+  <value>0</value>
+</configuration></prestashop>`);
+        if (ok) updated.push(configName); else skipped.push(`${configName}: PUT échoué`);
+      } else {
+        skipped.push(`${configName}: introuvable`);
+      }
+    } catch (err) {
+      skipped.push(`${configName}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // 2. Reconfigurer shop_urls (id_shop=1)
+  try {
+    const shopUrls: any[] = await getFullResource('shop_urls');
+    const match = shopUrls.find((s: any) => s.id_shop === '1');
+    if (match) {
+      const ok = await putXML('shop_urls', match.id, `<?xml version="1.0" encoding="UTF-8"?>
+<prestashop><shop_url>
+  <id>${match.id}</id>
+  <id_shop>1</id_shop>
+  <domain>localhost</domain>
+  <domain_ssl>localhost</domain_ssl>
+  <physical_uri>/e-commerce/eval/</physical_uri>
+  <virtual_uri></virtual_uri>
+  <main>1</main>
+  <active>1</active>
+</shop_url></prestashop>`);
+      if (ok) updated.push(`shop_url ${match.id}`); else skipped.push(`shop_url ${match.id}: PUT échoué`);
+    } else {
+      skipped.push('shop_url id_shop=1: introuvable');
+    }
+  } catch (err) {
+    skipped.push(`shop_urls: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (skipped.length > 0) {
+    console.warn('⚠️ Préparation import (avertissements non bloquants):', skipped);
+  }
+  console.log('✅ Préparation import terminée. Mis à jour:', updated);
 }
 
 async function importAll(): Promise<void> {

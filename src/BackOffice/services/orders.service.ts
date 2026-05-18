@@ -45,8 +45,8 @@ function currentSqlDate(): string {
 export async function getAllOrders(): Promise<Order[]> {
   try {
     const [orderRows, customerRows] = await Promise.all([
-      getFullResource('orders'),
-      getFullResource('customers').catch(() => []),
+      getFullResource('orders', '[id,reference,date_add,current_state,id_customer,id_cart,total_paid,conversion_rate]'),
+      getFullResource('customers', '[id,firstname,lastname]').catch(() => []),
     ]);
     const customers = new Map(
       (customerRows as any[]).map((customer) => [

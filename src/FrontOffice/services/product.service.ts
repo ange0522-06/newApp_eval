@@ -71,8 +71,8 @@ async function getTaxRate(idTaxRulesGroup: string): Promise<number> {
   }
 
   try {
-    const taxRules = await getFullResource('tax_rules')
-    const taxes = await getFullResource('taxes')
+    const taxRules = await getFullResource('tax_rules', '[id,id_tax_rules_group,id_tax]')
+    const taxes = await getFullResource('taxes', '[id,rate]')
     for (const rule of taxRules as any[]) {
       const groupId = rule.id_tax_rules_group || ''
 
@@ -144,7 +144,7 @@ let stockCacheLoaded = false
 async function preloadStocks(): Promise<void> {
   if (stockCacheLoaded) return
   try {
-    const stocks = await getFullResource('stock_availables')
+    const stocks = await getFullResource('stock_availables', '[id,id_product,id_product_attribute,quantity]')
     for (const stock of stocks as any[]) {
         const pid = stock.id_product || ''
         const cid = stock.id_product_attribute || '0'
@@ -343,7 +343,7 @@ function labelDuplicateCategoryNames(categories: Category[]): Category[] {
 
 export async function getAllCategories(): Promise<Category[]> {
   try {
-    const rows = await getFullResource('categories')
+    const rows = await getFullResource('categories', '[id,name,id_parent]')
     const categories: Category[] = []
 
     for (const category of rows as any[]) {

@@ -49,6 +49,23 @@ type CombinationInfo = {
   priceTTC: number;
 };
 
+const RESOURCE_DISPLAY_FIELDS: Record<string, string> = {
+  products: '[id,reference,name,price,available_date]',
+  categories: '[id,name,active,id_parent]',
+  taxes: '[id,rate,active,name]',
+  tax_rule_groups: '[id,name,active,deleted]',
+  tax_rules: '[id,id_tax_rules_group,id_country,id_tax]',
+  countries: '[id,iso_code,active]',
+  product_options: '[id,name,public_name,is_color_group]',
+  product_option_values: '[id,id_attribute_group,name]',
+  stock_availables: '[id,id_product,id_product_attribute,quantity]',
+  combinations: '[id,id_product,reference,default_on]',
+  specific_price_rules: '[id,name,price,from_quantity,reduction_type]',
+  customers: '[id,email,secure_key,firstname,lastname]',
+  carriers: '[id,active,deleted]',
+};
+const RESOURCE_PAGE_SIZE = 250;
+
 const productsByReference = new Map<string, ProductInfo>();
 const combinationsByReferenceAndValue = new Map<string, CombinationInfo>();
 const resourceFullCache = new Map<string, Map<string, Record<string, string>>>();
@@ -64,6 +81,7 @@ const customerInflight = new Map<string, Promise<{ id: string; secureKey: string
 let stockAvailableCacheLoaded = false;
 let combinationCacheLoaded = false;
 let defaultCountryId: string | null = null;
+let stockAvailableCacheInflight: Promise<void> | null = null;
 
 function resetImportCaches(): void {
   resourceFullCache.clear();
@@ -78,6 +96,7 @@ function resetImportCaches(): void {
   customerInflight.clear();
   stockAvailableCacheLoaded = false;
   combinationCacheLoaded = false;
+  stockAvailableCacheInflight = null;
   defaultCountryId = null;
 }
 
@@ -188,11 +207,21 @@ async function processInBatches<T>(
   }
 }
 
-async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Response> {
+function buildResourceListUrl(resource: string, display: string, offset: number, limit: number): string {
+  return `${API_CONFIG.BASE_URL}/${resource}?display=${display}&limit=${offset},${limit}`;
+}
+
+async function fetchResourceWithRetry(
+  resource: string,
+  display = RESOURCE_DISPLAY_FIELDS[resource] || 'full',
+  offset = 0,
+  limit = RESOURCE_PAGE_SIZE,
+  retries = 2
+): Promise<Response> {
   let lastResponse: Response | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const response = await fetch(`${API_CONFIG.BASE_URL}/${resource}?display=full`, {
+    const response = await fetch(buildResourceListUrl(resource, display, offset, limit), {
       method: 'GET',
       headers: { 'Content-Type': 'text/xml' },
     });
@@ -208,6 +237,15 @@ async function fetchResourceWithRetry(resource: string, retries = 2): Promise<Re
   return lastResponse as Response;
 }
 
+function readResourceNodes(resource: string, xmlText: string): Element[] {
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  const singular = getSingularResourceName(resource);
+  const container = doc.querySelector(resource);
+  return container
+    ? Array.from(container.children).filter((child) => child.tagName === singular)
+    : Array.from(doc.querySelectorAll(singular));
+}
+
 async function loadFullResource(resource: string): Promise<Map<string, Record<string, string>>> {
   const cached = resourceFullCache.get(resource);
   if (cached) return cached;
@@ -216,25 +254,25 @@ async function loadFullResource(resource: string): Promise<Map<string, Record<st
   if (inflight) return inflight;
 
   const promise = (async () => {
-    const response = await fetchResourceWithRetry(resource);
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
-    }
-
-    const xmlText = await response.text();
-    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-    const singular = getSingularResourceName(resource);
-    const container = doc.querySelector(resource);
-    const nodes = container
-      ? Array.from(container.children).filter((child) => child.tagName === singular)
-      : Array.from(doc.querySelectorAll(singular));
+    const display = RESOURCE_DISPLAY_FIELDS[resource] || 'full';
     const map = new Map<string, Record<string, string>>();
 
-    for (const node of nodes) {
-      const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
-      if (id) map.set(id, readResourceNode(node));
+    for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+      const response = await fetchResourceWithRetry(resource, display, offset, RESOURCE_PAGE_SIZE);
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`HTTP ${response.status}: ${response.statusText}${errorText ? ` - ${errorText.slice(0, 300)}` : ''}`);
+      }
+
+      const nodes = readResourceNodes(resource, await response.text());
+
+      for (const node of nodes) {
+        const id = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
+        if (id) map.set(id, readResourceNode(node));
+      }
+
+      if (nodes.length < RESOURCE_PAGE_SIZE) break;
     }
 
     resourceFullCache.set(resource, map);
@@ -308,6 +346,21 @@ async function findTaxByRate(rate: number): Promise<string | null> {
   return null;
 }
 
+async function findTaxRule(groupId: string, countryId: string, taxId: string): Promise<string | null> {
+  const rules = await loadFullResource('tax_rules');
+  for (const [id, data] of rules) {
+    if (
+      data.id_tax_rules_group === groupId
+      && data.id_country === countryId
+      && data.id_tax === taxId
+    ) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
 async function getDefaultCountryId(): Promise<string> {
   const forced = localStorage.getItem('forced_id_country');
   if (forced) return forced;
@@ -329,8 +382,6 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
   const percent = (rate * 100).toFixed(2);
   const countryId = await getDefaultCountryId();
   const groupName = `Import Tax ${percent}% Country ${countryId}`;
-  const existingGroup = await findByField('tax_rule_groups', 'name', groupName);
-  if (existingGroup) return existingGroup;
 
   let taxId = await findTaxByRate(rate);
   if (!taxId) {
@@ -350,20 +401,53 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
     cacheResource('taxes', taxId, { rate: percent, active: '1', name: `Tax ${percent}%` });
   }
 
-  const groupId = await postRequired(
-    'tax_rule_groups',
-    `<?xml version="1.0" encoding="UTF-8"?>
+  let groupId = await findByField('tax_rule_groups', 'name', groupName);
+  if (!groupId) {
+    const groupXml = `<?xml version="1.0" encoding="UTF-8"?>
 <prestashop>
   <tax_rule_group>
     <name>${cdata(groupName)}</name>
     <active>1</active>
     <deleted>0</deleted>
   </tax_rule_group>
-</prestashop>`,
-    `Groupe taxe ${percent}%`
-  );
-  transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
-  cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+</prestashop>`;
+    const result = (await postXML('tax_rule_groups', groupXml)) as unknown as CreatedResponse;
+    if (result?.success && result.id) {
+      groupId = String(result.id);
+      transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
+      cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+    } else {
+      // HTTP 500 avec réponse vide = PrestaShop a peut-être quand même inséré la ligne
+      // (doublon en DB, contrainte unique violée côté PHP). On force un rechargement du cache
+      // et on cherche par nom avant de considérer l'opération comme un vrai échec.
+      resourceFullCache.delete('tax_rule_groups');
+      await wait(300);
+      groupId = await findByField('tax_rule_groups', 'name', groupName);
+      if (!groupId) {
+        // Dernière tentative : chercher sans accent / normalisation (PrestaShop peut tronquer le CDATA)
+        const allGroups = await loadFullResource('tax_rule_groups');
+        for (const [id, data] of allGroups) {
+          const storedName = data.name || '';
+          if (
+            normalize(storedName).includes(normalize(`${percent}%`))
+            || normalize(storedName).includes(normalize(`Country ${countryId}`))
+          ) {
+            groupId = id;
+            break;
+          }
+        }
+      }
+      if (!groupId) {
+        throw new Error(`Groupe taxe ${percent}%: creation refusee par l'API${result?.error ? ` (${result.error})` : ''}`);
+      }
+      transaction.trackResource('fichier1', 'tax_rule_groups', groupId);
+      cacheResource('tax_rule_groups', groupId, { name: groupName, active: '1', deleted: '0' });
+      console.log(`♻️  Groupe taxe ${percent}% récupéré depuis l'API après erreur 500 (doublon probable): id=${groupId}`);
+    }
+  }
+
+  const existingRule = await findTaxRule(groupId, countryId, taxId);
+  if (existingRule) return groupId;
 
   const ruleId = await postRequired(
     'tax_rules',
@@ -383,7 +467,7 @@ async function ensureTaxRulesGroup(rate: number, transaction: ImportTransaction)
     `Regle taxe ${percent}%`
   );
   transaction.trackResource('fichier1', 'tax_rules', ruleId);
-  cacheResource('tax_rules', ruleId, { id_tax_rules_group: groupId, id_tax: taxId });
+  cacheResource('tax_rules', ruleId, { id_tax_rules_group: groupId, id_country: countryId, id_tax: taxId });
 
   return groupId;
 }
@@ -464,8 +548,9 @@ async function updateProductTypeToCombinations(productId: string, transaction: I
     throw new Error(`Impossible de changer le type du produit ${productId} en "combinations". Vérifier les logs PrestaShop.`);
   }
   
-  // 5. CRITIQUE: Attendre un peu et vérifier que le changement a vraiment pris effet
-  await wait(300);
+  // 5. ✅ CRITIQUE: Attendre PLUS LONGTEMPS pour que PrestaShop synchronise la DB
+  // Les erreurs 500 vides indiquent que PrestaShop n'a pas appliqué le changement
+  await wait(500);
   
   // 6. Recharger le produit et vérifier que product_type est bien "combinations"
   const verifyXml = (await getOneXml('products', productId)) as string;
@@ -481,6 +566,9 @@ async function updateProductTypeToCombinations(productId: string, transaction: I
   }
   
   console.log(`  ✓ Produit ${productId} maintenant en mode "combinations"`);
+  
+  // 7. ✅ Attendre UN PEU PLUS avant de retourner (sync DB complète)
+  await wait(500);
   
   // Tracker le changement pour rollback
   productsMarkedAsCombinations.add(productId);
@@ -512,44 +600,62 @@ async function updateResourceField(
 }
 
 async function loadAllStockAvailables(): Promise<Array<{ id: string; id_product: string; id_product_attribute: string; quantity: string }>> {
-  const response = await fetch(`${API_CONFIG.BASE_URL}/stock_availables?display=full`, {
-    method: 'GET',
-    headers: { 'Content-Type': 'text/xml' },
-  });
+  const allStocks: Array<{ id: string; id_product: string; id_product_attribute: string; quantity: string }> = [];
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
+  for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+    const response = await fetchResourceWithRetry(
+      'stock_availables',
+      RESOURCE_DISPLAY_FIELDS.stock_availables,
+      offset,
+      RESOURCE_PAGE_SIZE
+    );
 
-  const xmlText = await response.text();
-  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-  const nodes = Array.from(doc.querySelectorAll('stock_availables stock_available, stock_available'));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
 
-  return nodes
-    .map((node) => ({
+    const nodes = readResourceNodes('stock_availables', await response.text());
+    allStocks.push(...nodes.map((node) => ({
       id: node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '',
       id_product: node.querySelector('id_product')?.textContent?.trim() || '',
       id_product_attribute: node.querySelector('id_product_attribute')?.textContent?.trim() || '0',
       quantity: node.querySelector('quantity')?.textContent?.trim() || '0',
-    }))
-    .filter((stock) => Boolean(stock.id));
+    })).filter((stock) => Boolean(stock.id)));
+
+    if (nodes.length < RESOURCE_PAGE_SIZE) break;
+  }
+
+  return allStocks;
+}
+
+async function loadStockAvailableCache(force = false): Promise<void> {
+  if (stockAvailableCacheLoaded && !force) return;
+  if (stockAvailableCacheInflight) return stockAvailableCacheInflight;
+
+  stockAvailableCacheInflight = (async () => {
+    const stocks = await loadAllStockAvailables();
+    stockAvailableByProductKey.clear();
+    for (const stock of stocks) {
+      stockAvailableByProductKey.set(stockKey(stock.id_product, stock.id_product_attribute), stock.id);
+      cacheResource('stock_availables', stock.id, {
+        id_product: stock.id_product,
+        id_product_attribute: stock.id_product_attribute,
+        quantity: stock.quantity,
+      });
+    }
+    stockAvailableCacheLoaded = true;
+  })();
+
+  try {
+    await stockAvailableCacheInflight;
+  } finally {
+    stockAvailableCacheInflight = null;
+  }
 }
 
 async function findStockAvailableId(productId: string, combinationId = '0'): Promise<string | null> {
   try {
-    if (!stockAvailableCacheLoaded) {
-      const stocks = await loadAllStockAvailables();
-      stockAvailableByProductKey.clear();
-      for (const stock of stocks) {
-        stockAvailableByProductKey.set(stockKey(stock.id_product, stock.id_product_attribute), stock.id);
-        cacheResource('stock_availables', stock.id, {
-          id_product: stock.id_product,
-          id_product_attribute: stock.id_product_attribute,
-          quantity: stock.quantity,
-        });
-      }
-      stockAvailableCacheLoaded = true;
-    }
+    await loadStockAvailableCache();
     const match = stockAvailableByProductKey.get(stockKey(productId, combinationId));
     if (match) return match;
   } catch (error) {
@@ -569,6 +675,7 @@ async function findStockAvailableId(productId: string, combinationId = '0'): Pro
 function resetStockCache(): void {
   stockAvailableByProductKey.clear();
   stockAvailableCacheLoaded = false;
+  stockAvailableCacheInflight = null;
   console.log('🔄 Cache des stocks réinitialisé pour rechargement');
 }
 
@@ -582,30 +689,22 @@ async function updateStock(
 ): Promise<void> {
   let stockId = await findStockAvailableId(productId, combinationId);
   if (!stockId) {
-    stockId = await postRequired(
-      'stock_availables',
-      `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <stock_available>
-    <id_product>${productId}</id_product>
-    <id_product_attribute>${combinationId}</id_product_attribute>
-    <id_shop>${ID_SHOP}</id_shop>
-    <id_shop_group>0</id_shop_group>
-    <quantity>${quantity}</quantity>
-    <depends_on_stock>0</depends_on_stock>
-    <out_of_stock>0</out_of_stock>
-  </stock_available>
-</prestashop>`,
-      `Stock produit ${productId}/${combinationId}`
-    );
-    transaction.trackResource(step, 'stock_availables', stockId);
-    stockAvailableByProductKey.set(stockKey(productId, combinationId), stockId);
-    cacheResource('stock_availables', stockId, {
-      id_product: productId,
-      id_product_attribute: combinationId,
-      quantity: String(quantity),
-    });
-    return;
+    // ✅ CRITICAL FIX: PrestaShop crée automatiquement stock_available après combination
+    // Le cache n'est peut-être pas à jour. Forcer rechargement du cache des stocks
+    console.log(`⚠️  Stock non trouvé en cache pour ${productId}/${combinationId}, rechargement du cache...`);
+    await loadStockAvailableCache(true);
+    
+    // Chercher à nouveau après rechargement
+    stockId = stockAvailableByProductKey.get(stockKey(productId, combinationId)) ?? null;
+    if (!stockId) {
+      // ✅ Si toujours pas trouvé, le stock n'existe vraiment pas (erreur d'API)
+      // Ne pas faire POST (405 Method Not Allowed)
+      throw new Error(
+        `Stock produit ${productId}/${combinationId}: ` +
+        `impossible de créer (PrestaShop n'autorise pas POST sur stock_availables). ` +
+        `Vérifier que la combination a été créée correctement.`
+      );
+    }
   }
 
   await updateResourceField(transaction, step, 'stock_availables', stockId, 'quantity', quantity, trackUpdate);
@@ -732,43 +831,42 @@ async function loadCombinationCache(force = false): Promise<void> {
   }
 
   try {
-    const response = await fetch(`${API_CONFIG.BASE_URL}/combinations?display=full`, {
-      method: 'GET',
-      headers: { 'Content-Type': 'text/xml' },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
     if (force) {
       combinationIdByProductAndValueId.clear();
       combinationIdByProductAndReference.clear();
       productWithDefaultCombination.clear();
     }
 
-    const xmlText = await response.text();
-    const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
-    const nodes = Array.from(doc.querySelectorAll('combinations > combination, prestashop > combination, combination'));
-    for (const node of nodes) {
-      const combinationId = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
-      const idProduct = node.querySelector('id_product')?.textContent?.trim() || '';
-      const reference = node.querySelector('reference')?.textContent?.trim() || '';
-      const defaultOn = node.querySelector('default_on')?.textContent?.trim() || '';
-      if (combinationId && idProduct && reference) {
-        combinationIdByProductAndReference.set(combinationReferenceKey(idProduct, reference), combinationId);
+    for (let offset = 0; ; offset += RESOURCE_PAGE_SIZE) {
+      const response = await fetchResourceWithRetry('combinations', 'full', offset, RESOURCE_PAGE_SIZE);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      if (combinationId && idProduct && defaultOn === '1') {
-        productWithDefaultCombination.add(idProduct);
-      }
-      const values = Array.from(node.querySelectorAll('associations product_option_values product_option_value id'))
-        .map((valueNode) => valueNode.textContent?.trim())
-        .filter((value): value is string => Boolean(value));
-      for (const valueId of values) {
-        if (combinationId && idProduct) {
-          combinationIdByProductAndValueId.set(combinationValueKey(idProduct, valueId), combinationId);
+
+      const nodes = readResourceNodes('combinations', await response.text());
+      for (const node of nodes) {
+        const combinationId = node.getAttribute('id') || node.querySelector('id')?.textContent?.trim() || '';
+        const idProduct = node.querySelector('id_product')?.textContent?.trim() || '';
+        const reference = node.querySelector('reference')?.textContent?.trim() || '';
+        const defaultOn = node.querySelector('default_on')?.textContent?.trim() || '';
+        if (combinationId && idProduct && reference) {
+          combinationIdByProductAndReference.set(combinationReferenceKey(idProduct, reference), combinationId);
+        }
+        if (combinationId && idProduct && defaultOn === '1') {
+          productWithDefaultCombination.add(idProduct);
+        }
+        const values = Array.from(node.querySelectorAll('associations product_option_values product_option_value id'))
+          .map((valueNode) => valueNode.textContent?.trim())
+          .filter((value): value is string => Boolean(value));
+        for (const valueId of values) {
+          if (combinationId && idProduct) {
+            combinationIdByProductAndValueId.set(combinationValueKey(idProduct, valueId), combinationId);
+          }
         }
       }
+
+      if (nodes.length < RESOURCE_PAGE_SIZE) break;
     }
     combinationCacheLoaded = true;
   } catch (error) {
@@ -1176,6 +1274,40 @@ function buildCombinationXml(params: {
 </prestashop>`;
 }
 
+async function repairCombinationAfterCrash(params: {
+  productId: string;
+  combinationId: string;
+  valueId: string;
+  priceImpactHT: number;
+  isDefault: boolean;
+}): Promise<void> {
+  try {
+    const response = await fetch('/newapp-api/prepare-import.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'repair-combination',
+        productId: params.productId,
+        combinationId: params.combinationId,
+        valueId: params.valueId,
+        priceImpactHT: params.priceImpactHT,
+        isDefault: params.isDefault,
+      }),
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok || !result?.success) {
+      throw new Error(result?.message || `HTTP ${response.status}`);
+    }
+    stockAvailableCacheLoaded = false;
+    combinationCacheLoaded = false;
+  } catch (error) {
+    console.warn(
+      `Réparation locale de la déclinaison ${params.combinationId} impossible:`,
+      error
+    );
+  }
+}
+
 async function createCombinationWithRecovery(params: {
   productId: string;
   reference: string;
@@ -1184,7 +1316,33 @@ async function createCombinationWithRecovery(params: {
   isDefault: boolean;
 }): Promise<{ id: string; created: boolean }> {
   const existingBefore = await findCombination(params.productId, params.valueId, params.reference);
-  if (existingBefore) return { id: existingBefore, created: false };
+  if (existingBefore) {
+    await repairCombinationAfterCrash({
+      productId: params.productId,
+      combinationId: existingBefore,
+      valueId: params.valueId,
+      priceImpactHT: params.priceImpactHT,
+      isDefault: params.isDefault,
+    });
+    return { id: existingBefore, created: false };
+  }
+
+  // ✅ CRITIQUE: Vérifier que le produit est bien en mode "combinations" avant POST
+  // Les erreurs 500 vides = le produit n'est pas en mode "combinations" en BD
+  const productXml = (await getOneXml('products', params.productId)) as string;
+  const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+  const productType = doc.querySelector('product_type')?.textContent?.trim();
+  
+  if (productType !== 'combinations') {
+    throw new Error(
+      `Produit ${params.productId}: type invalide pour combination "${productType}". ` +
+      `Doit être "combinations". ` +
+      `Vérifier que updateProductTypeToCombinations() a bien exécuté avant cette étape.`
+    );
+  }
+  
+  // ✅ Attendre un peu pour que les verrous BD se libèrent
+  await wait(200);
 
   const firstXml = buildCombinationXml(params);
   const firstResult = (await postXML('combinations', firstXml)) as unknown as CreatedResponse;
@@ -1201,7 +1359,16 @@ async function createCombinationWithRecovery(params: {
   await wait(300);
   await loadCombinationCache(true);
   const existingAfterCrash = await findCombination(params.productId, params.valueId, params.reference);
-  if (existingAfterCrash) return { id: existingAfterCrash, created: false };
+  if (existingAfterCrash) {
+    await repairCombinationAfterCrash({
+      productId: params.productId,
+      combinationId: existingAfterCrash,
+      valueId: params.valueId,
+      priceImpactHT: params.priceImpactHT,
+      isDefault: params.isDefault,
+    });
+    return { id: existingAfterCrash, created: false };
+  }
 
   if (params.isDefault) {
     const retryXml = buildCombinationXml({ ...params, isDefault: false });
@@ -1216,7 +1383,16 @@ async function createCombinationWithRecovery(params: {
     await wait(300);
     await loadCombinationCache(true);
     const existingAfterRetry = await findCombination(params.productId, params.valueId, params.reference);
-    if (existingAfterRetry) return { id: existingAfterRetry, created: false };
+    if (existingAfterRetry) {
+      await repairCombinationAfterCrash({
+        productId: params.productId,
+        combinationId: existingAfterRetry,
+        valueId: params.valueId,
+        priceImpactHT: params.priceImpactHT,
+        isDefault: false,
+      });
+      return { id: existingAfterRetry, created: false };
+    }
 
     throw new Error(`Declinaison ${params.reference}: creation refusee par l'API (${retryResult.error || firstResult.error || 'HTTP 500'})`);
   }
@@ -1326,6 +1502,14 @@ export async function importDeclinaisons(
   headers: string[],
   transaction: ImportTransaction
 ): Promise<void> {
+  // ✅ CRITICAL: Réinitialiser les caches au début de fichier 2
+  // combinationCacheLoaded et stockAvailableCacheLoaded doivent être false pour recharger depuis API
+  // ✅ CRITICAL: Réinitialiser productsMarkedAsCombinations pour forcer le re-check du product_type
+  // Sans cela, lors du 2e import, on retourne immédiatement sans vérifier si le changement "a tenu"
+  combinationCacheLoaded = false;
+  stockAvailableCacheLoaded = false;
+  productsMarkedAsCombinations.clear();
+  
   transaction.registerStep('fichier2');
   const startTime = performance.now();
   
@@ -1815,40 +1999,30 @@ export async function importCommandes(
     transaction.trackResource('fichier3', 'order_histories', historyId);
   }, 1);
 
-  // ✅ Corriger les dates des ordres (PrestaShop les ignore via l'API)
+  // ✅ Corriger les dates des ordres via l'API PrestaShop directement (plus de PHP requis)
   if (ordersToFixDates.length > 0) {
-    console.log(`⚡ Correction des dates pour ${ordersToFixDates.length} commandes...`);
-    console.log('📋 Ordres à corriger:', ordersToFixDates);
-    try {
-      const payload = JSON.stringify({ orders: ordersToFixDates });
-      console.log('📤 Envoi à /newapp-api/fix-order-dates.php:', payload.substring(0, 200) + '...');
-      
-      const response = await fetch('/newapp-api/fix-order-dates.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: payload,
-      });
-      
-      console.log(`📥 Réponse statut: ${response.status}`);
-      const text = await response.text();
-      console.log('📥 Réponse brute:', text.substring(0, 500));
-      
-      let result: any;
+    console.log(`⚡ Correction des dates pour ${ordersToFixDates.length} commandes via l'API PrestaShop...`);
+    let fixed = 0;
+    let failed = 0;
+    await processInBatches(ordersToFixDates, 10, async ({ id, date }) => {
       try {
-        result = JSON.parse(text);
-      } catch (parseError) {
-        throw new Error(`Impossible de parser la réponse JSON: ${text}`);
+        const orderXml = (await getOneXml('orders', id)) as string;
+        if (!orderXml) { failed++; return; }
+        const doc = new DOMParser().parseFromString(orderXml, 'text/xml');
+        removeNotWritableFields(doc);
+        const dateAddEl = doc.querySelector('date_add');
+        const dateUpdEl = doc.querySelector('date_upd');
+        if (dateAddEl) dateAddEl.textContent = date;
+        if (dateUpdEl) dateUpdEl.textContent = date;
+        const updatedXml = new XMLSerializer().serializeToString(doc);
+        const ok = await putXML('orders', id, updatedXml);
+        if (ok) { fixed++; } else { failed++; console.warn(`⚠️ Impossible de corriger la date de la commande ${id}`); }
+      } catch (err) {
+        failed++;
+        console.warn(`⚠️ Erreur correction date commande ${id}:`, err);
       }
-      
-      if (result.success) {
-        console.log(`✅ Dates corrigées avec succès pour ${result.fixed} commandes`);
-      } else {
-        console.warn(`⚠️ Correction partielle des dates: ${result.fixed} réussis, ${result.failed} échoués`, result.errors);
-      }
-    } catch (error) {
-      console.error('❌ Erreur lors de la correction des dates:', error);
-      throw error; // Re-throw pour que la transaction le capture
-    }
+    }, 3);
+    console.log(`✅ Dates commandes: ${fixed} corrigées, ${failed} ignorées (non bloquant)`);
   }
 
   transaction.markStepSuccess('fichier3');
