@@ -1,4 +1,4 @@
-import { getFullResource } from '@/shared/services/prestashop.service.js';
+import { getFullResource, getOneXml, putXML } from '@/shared/services/prestashop.service.js';
 
 export interface StockCategoryRow {
   categoryId: string;
@@ -8,58 +8,259 @@ export interface StockCategoryRow {
   availableQty: number;
 }
 
+export interface ProductStockOption {
+  stockId: string;
+  productId: string;
+  combinationId: string;
+  label: string;
+  reference: string;
+  quantity: number;
+  categoryId: string;
+  categoryName: string;
+}
+
+export interface StockEvolutionRow {
+  date: string;
+  incomingQty: number;
+  outgoingQty: number;
+  balanceQty: number;
+  source: string;
+}
+
+type StockHistoryEntry = {
+  productId: string;
+  combinationId: string;
+  previousQty: number;
+  nextQty: number;
+  delta: number;
+  date: string;
+  source: string;
+}
+
+const RESERVED_ORDER_STATES = new Set(['2', '13']);
+const HISTORY_KEY = 'bo_stock_manual_history';
+
+function parseQty(value: unknown): number {
+  const qty = Number.parseInt(String(value ?? '0'), 10);
+  return Number.isFinite(qty) ? qty : 0;
+}
+
+function dateOnly(value: string): string {
+  return (value || new Date().toISOString()).slice(0, 10);
+}
+
+function readHistory(): StockHistoryEntry[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(entry: StockHistoryEntry): void {
+  const history = readHistory();
+  history.push(entry);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-500)));
+}
+
+function setFirstTag(doc: Document, tagName: string, value: string | number): void {
+  const element = doc.getElementsByTagName(tagName)[0];
+  if (!element) throw new Error(`Champ ${tagName} introuvable dans le XML stock.`);
+  element.textContent = String(value);
+}
+
+function sanitizeStockXml(doc: Document): void {
+  doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
+}
+
+async function getReferenceByCombination(): Promise<Map<string, string>> {
+  const rows = await getFullResource('combinations', '[id,reference]').catch(() => []);
+  return new Map((rows as any[]).map((combination) => [
+    combination.id,
+    combination.reference || `Declinaison #${combination.id}`,
+  ]));
+}
+
+async function getBaseMaps() {
+  const [productsRaw, categoriesRaw] = await Promise.all([
+    getFullResource('products', '[id,reference,name,id_category_default]').catch(() => []),
+    getFullResource('categories', '[id,name]').catch(() => []),
+  ]);
+
+  const categoryMap = new Map<string, string>();
+  for (const category of categoriesRaw as any[]) {
+    categoryMap.set(category.id, category.name || `Categorie ${category.id}`);
+  }
+
+  const productMap = new Map<string, any>();
+  for (const product of productsRaw as any[]) {
+    productMap.set(product.id, product);
+  }
+
+  return { productMap, categoryMap };
+}
+
+async function getReservedQuantityByStockKey(): Promise<Map<string, number>> {
+  const [ordersRaw, detailsRaw] = await Promise.all([
+    getFullResource('orders', '[id,current_state]').catch(() => []),
+    getFullResource('order_details', '[id_order,product_id,product_attribute_id,product_quantity]').catch(() => []),
+  ]);
+
+  const reservedOrderIds = new Set(
+    (ordersRaw as any[])
+      .filter((order) => RESERVED_ORDER_STATES.has(order.current_state || ''))
+      .map((order) => order.id)
+  );
+  const reservedByKey = new Map<string, number>();
+
+  for (const detail of detailsRaw as any[]) {
+    if (!reservedOrderIds.has(detail.id_order)) continue;
+    const key = `${detail.product_id || ''}_${detail.product_attribute_id || '0'}`;
+    reservedByKey.set(key, (reservedByKey.get(key) || 0) + parseQty(detail.product_quantity));
+  }
+
+  return reservedByKey;
+}
+
+export async function getProductStockOptions(): Promise<ProductStockOption[]> {
+  const [stockAvailablesRaw, baseMaps, combinationReferences] = await Promise.all([
+    getFullResource('stock_availables', '[id,id_product,id_product_attribute,quantity]').catch(() => []),
+    getBaseMaps(),
+    getReferenceByCombination(),
+  ]);
+
+  return (stockAvailablesRaw as any[])
+    .map((stock) => {
+      const product = baseMaps.productMap.get(stock.id_product);
+      const categoryId = product?.id_category_default || 'unknown';
+      const combinationId = stock.id_product_attribute || '0';
+      const combinationLabel = combinationId !== '0'
+        ? ` - ${combinationReferences.get(combinationId) || `Declinaison #${combinationId}`}`
+        : '';
+
+      return {
+        stockId: stock.id,
+        productId: stock.id_product || '',
+        combinationId,
+        label: `${product?.name || `Produit #${stock.id_product}`}${combinationLabel}`,
+        reference: product?.reference || '',
+        quantity: parseQty(stock.quantity),
+        categoryId,
+        categoryName: baseMaps.categoryMap.get(categoryId) || (categoryId === 'unknown' ? 'Inconnue' : `Categorie ${categoryId}`),
+      };
+    })
+    .filter((stock) => stock.stockId && stock.productId)
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export async function updateProductStockQuantity(option: ProductStockOption, nextQty: number): Promise<ProductStockOption> {
+  const normalizedQty = Math.max(0, Math.floor(nextQty || 0));
+  const previousXml = await getOneXml('stock_availables', option.stockId) as string;
+  const doc = new DOMParser().parseFromString(previousXml, 'text/xml');
+  sanitizeStockXml(doc);
+  setFirstTag(doc, 'quantity', normalizedQty);
+
+  const ok = await putXML('stock_availables', option.stockId, new XMLSerializer().serializeToString(doc));
+  if (!ok) throw new Error('Mise a jour du stock impossible.');
+
+  appendHistory({
+    productId: option.productId,
+    combinationId: option.combinationId,
+    previousQty: option.quantity,
+    nextQty: normalizedQty,
+    delta: normalizedQty - option.quantity,
+    date: new Date().toISOString(),
+    source: 'BO',
+  });
+
+  return { ...option, quantity: normalizedQty };
+}
+
+export async function addProductStockQuantity(option: ProductStockOption, addedQty: number): Promise<ProductStockOption> {
+  return updateProductStockQuantity(option, option.quantity + Math.max(0, Math.floor(addedQty || 0)));
+}
+
+export async function getStockEvolution(option: ProductStockOption): Promise<StockEvolutionRow[]> {
+  const rowsByDate = new Map<string, { incomingQty: number; outgoingQty: number; sources: Set<string> }>();
+
+  function addMovement(date: string, delta: number, source: string) {
+    const key = dateOnly(date);
+    const row = rowsByDate.get(key) || { incomingQty: 0, outgoingQty: 0, sources: new Set<string>() };
+    if (delta >= 0) row.incomingQty += delta;
+    else row.outgoingQty += Math.abs(delta);
+    row.sources.add(source);
+    rowsByDate.set(key, row);
+  }
+
+  for (const entry of readHistory()) {
+    if (entry.productId === option.productId && (entry.combinationId || '0') === option.combinationId) {
+      addMovement(entry.date, entry.delta, entry.source);
+    }
+  }
+
+  const [ordersRaw, detailsRaw] = await Promise.all([
+    getFullResource('orders', '[id,date_add,current_state]').catch(() => []),
+    getFullResource('order_details', '[id_order,product_id,product_attribute_id,product_quantity]').catch(() => []),
+  ]);
+  const deliveredOrders = new Map(
+    (ordersRaw as any[])
+      .filter((order) => order.current_state === '5')
+      .map((order) => [order.id, order.date_add || ''])
+  );
+
+  for (const detail of detailsRaw as any[]) {
+    const orderDate = deliveredOrders.get(detail.id_order);
+    if (!orderDate) continue;
+    if (detail.product_id !== option.productId) continue;
+    if ((detail.product_attribute_id || '0') !== option.combinationId) continue;
+    addMovement(orderDate, -parseQty(detail.product_quantity), 'Livraison');
+  }
+
+  const sorted = Array.from(rowsByDate.entries()).sort(([a], [b]) => a.localeCompare(b));
+  const totalDelta = sorted.reduce((sum, [, row]) => sum + row.incomingQty - row.outgoingQty, 0);
+  let balance = option.quantity - totalDelta;
+
+  return sorted.map(([date, row]) => {
+    balance += row.incomingQty - row.outgoingQty;
+    return {
+      date,
+      incomingQty: row.incomingQty,
+      outgoingQty: row.outgoingQty,
+      balanceQty: balance,
+      source: Array.from(row.sources).join(', '),
+    };
+  }).reverse();
+}
+
 export async function getStockAnalysis(): Promise<StockCategoryRow[]> {
   try {
-    const [productsRaw, categoriesRaw, stockAvailablesRaw] = await Promise.all([
-      getFullResource('products', '[id,id_category_default]').catch(() => []),
-      getFullResource('categories', '[id,name]').catch(() => []),
-      getFullResource('stock_availables', '[id,id_product,id_product_attribute,quantity]').catch(() => [])
+    const [stockOptions, reservedByKey] = await Promise.all([
+      getProductStockOptions(),
+      getReservedQuantityByStockKey(),
     ]);
 
-    const categoryMap = new Map<string, string>();
-    for (const c of categoriesRaw as any[]) {
-      categoryMap.set(c.id, c.name || `Catégorie ${c.id}`);
-    }
-
-    const productMap = new Map<string, any>();
-    for (const p of productsRaw as any[]) {
-      productMap.set(p.id, p);
-    }
-
     const stockMap = new Map<string, StockCategoryRow>();
-
-    for (const stock of stockAvailablesRaw as any[]) {
-      if (stock.id_product_attribute && stock.id_product_attribute !== '0') continue; // Only process main products for simplicity
-
-      const productId = stock.id_product;
-      const product = productMap.get(productId);
-      
-      const catId = product?.id_category_default || 'unknown';
-      const catName = categoryMap.get(catId) || (catId === 'unknown' ? 'Inconnue' : `Catégorie ${catId}`);
-
-      const qty = parseInt(stock.quantity || '0', 10) || 0;
-      const physicalQty = qty;
-      const reservedQty = 0;
-      const availableQty = physicalQty - reservedQty;
-
-      const row = stockMap.get(catId) || {
-        categoryId: catId,
-        categoryName: catName,
+    for (const stock of stockOptions) {
+      const key = `${stock.productId}_${stock.combinationId || '0'}`;
+      const reservedQty = reservedByKey.get(key) || 0;
+      const row = stockMap.get(stock.categoryId) || {
+        categoryId: stock.categoryId,
+        categoryName: stock.categoryName,
         physicalQty: 0,
         reservedQty: 0,
-        availableQty: 0
+        availableQty: 0,
       };
 
-      row.physicalQty += physicalQty;
+      row.physicalQty += stock.quantity;
       row.reservedQty += reservedQty;
-      row.availableQty += availableQty;
-
-      stockMap.set(catId, row);
+      row.availableQty += Math.max(0, stock.quantity - reservedQty);
+      stockMap.set(stock.categoryId, row);
     }
 
     return Array.from(stockMap.values()).sort((a, b) => a.categoryName.localeCompare(b.categoryName));
   } catch (error) {
-    console.error("Erreur lors de la récupération de l'analyse des stocks:", error);
+    console.error("Erreur lors de la recuperation de l'analyse des stocks:", error);
     throw error;
   }
 }

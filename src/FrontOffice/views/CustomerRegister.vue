@@ -70,10 +70,13 @@ function validateRequiredFields(): boolean {
   return true
 }
 
-function authenticateCustomer(customerEmail: string) {
+function authenticateCustomer(customerId: string | number | undefined) {
   localStorage.setItem('auth_authenticated', 'true')
-  localStorage.setItem('auth_email', customerEmail)
-  localStorage.setItem('auth_token', String(Date.now()))
+  localStorage.setItem('auth_email', email.value)
+  localStorage.setItem('auth_token', `${customerId || 'customer'}-${Date.now()}`)
+  if (customerId) localStorage.setItem('auth_customer_id', String(customerId))
+  localStorage.setItem('auth_customer_name', `${firstname.value} ${lastname.value}`.trim())
+  localStorage.removeItem('auth_is_anonymous')
 }
 
 function goLogin() {
@@ -114,7 +117,7 @@ async function handleRegister() {
 
     const res = await postXML('customers', xml)
     if (res.success) {
-      authenticateCustomer(email.value)
+      authenticateCustomer(res.id)
       router.push(redirectTarget.value)
       return
     }

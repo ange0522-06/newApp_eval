@@ -17,12 +17,13 @@
 
     <div v-else-if="customers.length === 0" class="state-box">
       Aucun utilisateur existant.
-      <button type="button" @click="selectAnonymous">Continuer en anonyme</button>
+      <button v-if="!requiresExistingCustomer" type="button" @click="selectAnonymous">Continuer en anonyme</button>
       <button type="button" @click="goRegister">Creer un client</button>
     </div>
 
     <div v-else class="customers-grid">
       <button
+        v-if="!requiresExistingCustomer"
         class="customer-card customer-card--anonymous"
         type="button"
         @click="selectAnonymous"
@@ -64,7 +65,7 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   authenticateAnonymousCustomer,
@@ -82,6 +83,10 @@ const loadingState = ref<LoadingState>('idle')
 const selectedCustomer = ref<CustomerOption | null>(null)
 const verificationEmail = ref('')
 const verificationError = ref('')
+
+const requiresExistingCustomer = computed(() =>
+  route.query.checkout === '1' || route.query.redirect === '/checkout' || route.query.redirect === '/my-orders'
+)
 
 function redirectTarget(): string {
   return typeof route.query.redirect === 'string' ? route.query.redirect : '/home'

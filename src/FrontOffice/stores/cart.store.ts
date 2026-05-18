@@ -7,7 +7,7 @@ const ID_SHOP_GROUP = 1
 const ID_CURRENCY = 1
 const ID_LANG = 1
 const DEFAULT_EMPLOYEE = 1
-const CASH_ON_DELIVERY_STATE = '13'
+const ORDER_STATE_PAID = '2'
 const CASH_ON_DELIVERY_MODULE = 'ps_cashondelivery'
 const CASH_ON_DELIVERY_LABEL = 'Paiement a la livraison'
 const FALLBACK_COUNTRY_ID = '8'
@@ -230,41 +230,6 @@ export const useCartStore = defineStore('cart', () => {
     return getCreatedId(result, label)
   }
 
-  async function createAnonymousCustomer(
-    address: { firstname: string, lastname: string }
-  ): Promise<string> {
-    const createdAt = nowForPrestaShop()
-    const email = localStorage.getItem('auth_email') || `anonymous-${Date.now()}@newapp.local`
-    const firstname = address.firstname || 'Utilisateur'
-    const lastname = address.lastname || 'Anonyme'
-    const xmlCustomer = `<?xml version="1.0" encoding="UTF-8"?>
-<prestashop>
-  <customer>
-    <id_default_group>3</id_default_group>
-    <id_lang>${ID_LANG}</id_lang>
-    <passwd>${cdata(`anonymous-${Date.now()}`)}</passwd>
-    <lastname>${cdata(lastname)}</lastname>
-    <firstname>${cdata(firstname)}</firstname>
-    <email>${cdata(email)}</email>
-    <active>1</active>
-    <is_guest>1</is_guest>
-    <id_shop>${ID_SHOP}</id_shop>
-    <id_shop_group>${ID_SHOP_GROUP}</id_shop_group>
-    <date_add>${createdAt}</date_add>
-    <date_upd>${createdAt}</date_upd>
-    <associations>
-      <groups>
-        <group><id>3</id></group>
-      </groups>
-    </associations>
-  </customer>
-</prestashop>`
-
-    const customerId = await postRequired('customers', xmlCustomer, 'anonymous_customer')
-    localStorage.setItem('auth_customer_id', customerId)
-    return customerId
-  }
-
   function validateCartStock(): { success: boolean, error?: string } {
     clearStockError()
     for (const item of items.value) {
@@ -289,17 +254,15 @@ export const useCartStore = defineStore('cart', () => {
       localStorage.getItem('auth_authenticated') === 'true' &&
       localStorage.getItem('auth_email') !== null &&
       localStorage.getItem('auth_token') !== null
-    // We do NOT block if not authenticated, to allow anonymous checkout
+    if (!isCustomerAuthenticated || localStorage.getItem('auth_is_anonymous') === 'true') {
+      return { success: false, error: 'existing_customer_required' }
+    }
 
     const email = localStorage.getItem('auth_email') || `anonymous-${Date.now()}@newapp.local`
 
-    let idCustomer = await findCustomerIdByEmail(email)
-    if (!idCustomer && localStorage.getItem('auth_is_anonymous') === 'true') {
-      try {
-        idCustomer = await createAnonymousCustomer(address)
-      } catch (error) {
-        return { success: false, error: error instanceof Error ? error.message : 'anonymous_customer_creation_failed' }
-      }
+    let idCustomer = localStorage.getItem('auth_customer_id')
+    if (!idCustomer || idCustomer === 'anonymous') {
+      idCustomer = await findCustomerIdByEmail(email)
     }
     if (!idCustomer) return { success: false, error: 'customer_not_found' }
 
@@ -422,7 +385,7 @@ export const useCartStore = defineStore('cart', () => {
     <payment>${cdata(CASH_ON_DELIVERY_LABEL)}</payment>
     <id_customer>${idCustomer}</id_customer>
     <id_carrier>${idCarrier}</id_carrier>
-    <current_state>${CASH_ON_DELIVERY_STATE}</current_state>
+    <current_state>${ORDER_STATE_PAID}</current_state>
     <secure_key>${xml(secureKey)}</secure_key>
     <total_discounts>0.000000</total_discounts>
     <total_discounts_tax_incl>0.000000</total_discounts_tax_incl>
@@ -441,7 +404,7 @@ export const useCartStore = defineStore('cart', () => {
     <total_wrapping_tax_incl>0.000000</total_wrapping_tax_incl>
     <total_wrapping_tax_excl>0.000000</total_wrapping_tax_excl>
     <conversion_rate>1.000000</conversion_rate>
-    <valid>0</valid>
+    <valid>1</valid>
     <date_add>${createdAt}</date_add>
     <date_upd>${createdAt}</date_upd>
     <associations>
@@ -458,7 +421,7 @@ export const useCartStore = defineStore('cart', () => {
 <prestashop>
   <order_history>
     <id_employee>${DEFAULT_EMPLOYEE}</id_employee>
-    <id_order_state>${CASH_ON_DELIVERY_STATE}</id_order_state>
+    <id_order_state>${ORDER_STATE_PAID}</id_order_state>
     <id_order>${idOrder}</id_order>
     <date_add>${createdAt}</date_add>
   </order_history>

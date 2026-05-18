@@ -31,6 +31,12 @@
       <div class="product-detail__info">
 
         <!-- Nom et référence -->
+        <span
+          v-if="product.releaseBadge"
+          :class="['product-detail__badge', `product-detail__badge--${product.releaseBadge.toLowerCase()}`]"
+        >
+          {{ product.releaseBadge }}
+        </span>
         <h1 class="product-detail__name">{{ product.name }}</h1>
         <p class="product-detail__reference">Réf : {{ product.reference }}</p>
 
@@ -433,6 +439,23 @@ onMounted(() => {
   font-size: 1.5rem;
   font-weight: 700;
   margin: 0;
+}
+
+.product-detail__badge {
+  align-self: flex-start;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 800;
+  padding: 0.25rem 0.6rem;
+}
+
+.product-detail__badge--hot {
+  background: #dc2626;
+}
+
+.product-detail__badge--new {
+  background: #2563eb;
 }
 
 .product-detail__reference {

@@ -27,7 +27,7 @@ export interface Order {
 
 const STATE_MAP: { [key: string]: string } = {
   '13': 'Paiement a la livraison',
-  '2': 'Paiement accepte',
+  '2': 'Paiement effectue',
   '5': 'Livre',
   '6': 'Annule',
 };

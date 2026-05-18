@@ -10,10 +10,6 @@
     <div v-else-if="!result?.success">
       <form @submit.prevent="handleSubmit">
         <p v-if="formError" class="error">{{ formError }}</p>
-        <div class="field" v-if="!isAuthenticated">
-          <label>Email</label>
-          <input type="email" v-model="email" required />
-        </div>
         <div class="field">
           <label>Prenom</label>
           <input v-model="firstname" required />
@@ -75,7 +71,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useCartStore } from '../stores/cart.store'
 
@@ -84,7 +80,6 @@ const router = useRouter()
 
 const firstname = ref('')
 const lastname = ref('')
-const email = ref('')
 const address1 = ref('')
 const city = ref('')
 const postcode = ref('')
@@ -93,7 +88,10 @@ const isPlacing = ref(false)
 const result = ref<any>(null)
 const formError = ref('')
 
-const isAuthenticated = computed(() => localStorage.getItem('auth_authenticated') === 'true')
+const isAuthenticated = computed(() =>
+  localStorage.getItem('auth_authenticated') === 'true' &&
+  localStorage.getItem('auth_is_anonymous') !== 'true'
+)
 
 const total = computed(() => cart.totalTTC)
 
@@ -103,8 +101,9 @@ function formatPrice(value: number) {
 
 async function handleSubmit() {
   formError.value = ''
-  if (!isAuthenticated.value && !email.value) {
-    formError.value = 'L\'email est requis pour les commandes anonymes.'
+  if (!isAuthenticated.value) {
+    formError.value = 'Vous devez choisir un compte client existant avant de commander.'
+    router.push({ path: '/front/customers', query: { redirect: '/checkout', checkout: '1' } })
     return
   }
   if (!firstname.value || !lastname.value || !address1.value || !city.value || !postcode.value) {
@@ -112,10 +111,6 @@ async function handleSubmit() {
     return
   }
   
-  if (!isAuthenticated.value && email.value) {
-    localStorage.setItem('auth_email', email.value)
-  }
-
   const stockCheck = cart.validateCartStock()
   if (!stockCheck.success) return
 
@@ -132,8 +127,18 @@ async function handleSubmit() {
   })
 
   result.value = res
+  if (!res.success && res.error === 'existing_customer_required') {
+    formError.value = 'Vous devez choisir un compte client existant avant de commander.'
+    router.push({ path: '/front/customers', query: { redirect: '/checkout', checkout: '1' } })
+  }
   isPlacing.value = false
 }
+
+onMounted(() => {
+  if (!isAuthenticated.value) {
+    router.push({ path: '/front/customers', query: { redirect: '/checkout', checkout: '1' } })
+  }
+})
 </script>
 
 <style scoped>

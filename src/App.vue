@@ -69,6 +69,9 @@ function handleCustomerLogout() {
         <button class="nav-button" @click="$router.push('/back/stocks')">
           📊 Stocks
         </button>
+        <button class="nav-button" @click="$router.push('/back/statistics')">
+          Statistiques
+        </button>
         <button class="nav-button" @click="$router.push('/back/reset')">
           🔄 Réinitialiser
         </button>
@@ -89,6 +92,9 @@ function handleCustomerLogout() {
             Inscription
           </button>
           <span v-if="isCustomerAuthenticated" class="customer-pill">{{ customerName }}</span>
+          <button v-if="isCustomerAuthenticated" class="fo-link" type="button" @click="$router.push('/my-orders')">
+            Mes commandes
+          </button>
           <button v-if="isCustomerAuthenticated" class="fo-link" type="button" @click="handleCustomerLogout">
             Deconnexion
           </button>

@@ -44,10 +44,13 @@ function isPasswordValid(storedPassword: string, plainPassword: string): boolean
     storedPassword === hashed.toLowerCase()
 }
 
-function authenticateCustomer(customerEmail: string) {
+function authenticateCustomer(customerId: string, customer: any) {
   localStorage.setItem('auth_authenticated', 'true')
-  localStorage.setItem('auth_email', customerEmail)
-  localStorage.setItem('auth_token', String(Date.now()))
+  localStorage.setItem('auth_email', customer.email)
+  localStorage.setItem('auth_token', `${customerId}-${Date.now()}`)
+  localStorage.setItem('auth_customer_id', customerId)
+  localStorage.setItem('auth_customer_name', `${customer.firstname || ''} ${customer.lastname || ''}`.trim())
+  localStorage.removeItem('auth_is_anonymous')
 }
 
 function goRegister() {
@@ -69,7 +72,7 @@ async function handleLogin() {
         const customer = (await getOne('customers', id)) as any
         if (customer && customer.email === email.value) {
           if (customer.passwd && isPasswordValid(customer.passwd, password.value)) {
-            authenticateCustomer(email.value)
+            authenticateCustomer(id, customer)
             router.push(redirectTarget.value)
             return
           }

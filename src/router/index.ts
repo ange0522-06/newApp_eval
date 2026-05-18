@@ -8,6 +8,7 @@ import OrdersView from '../BackOffice/views/OrdersView.vue';
 import ResetView from '../BackOffice/views/ResetView.vue';
 import DashboardView from '../BackOffice/views/DashboardView.vue';
 import StocksView from '../BackOffice/views/StocksView.vue';
+import StatisticsView from '../BackOffice/views/StatisticsView.vue';
 
 // Front-Office Views
 import HomeView from '../FrontOffice/views/HomeView.vue';
@@ -25,6 +26,7 @@ import LandingView from '../shared/views/LandingView.vue';
 declare module 'vue-router' {
   interface RouteMeta {
     requiresAuth?: boolean;
+    requiresExistingCustomer?: boolean;
   }
 }
 
@@ -75,7 +77,14 @@ const routes: RouteRecordRaw[] = [
     path: '/checkout',
     name: 'Checkout',
     component: CheckoutView,
-    meta: { requiresAuth: true },
+    meta: { requiresAuth: true, requiresExistingCustomer: true },
+  },
+
+  {
+    path: '/my-orders',
+    name: 'MyOrders',
+    component: () => import('../FrontOffice/views/MyOrdersView.vue'),
+    meta: { requiresAuth: true, requiresExistingCustomer: true },
   },
 
   // Front-office customer auth
@@ -132,6 +141,13 @@ const routes: RouteRecordRaw[] = [
   },
 
   {
+    path: '/back/statistics',
+    name: 'BackStatistics',
+    component: StatisticsView,
+    meta: { requiresAuth: true },
+  },
+
+  {
     path: '/back/reset',
     name: 'BackReset',
     component: ResetView,
@@ -172,6 +188,7 @@ router.beforeEach((to, from) => {
     localStorage.getItem('auth_authenticated') === 'true' &&
     localStorage.getItem('auth_email') !== null &&
     localStorage.getItem('auth_token') !== null;
+  const isAnonymousCustomer = localStorage.getItem('auth_is_anonymous') === 'true';
   const isAuthenticated = isBackOfficeRoute ? isBackOfficeAuthenticated : isCustomerAuthenticated;
   const requiresAuth = to.meta.requiresAuth !== false; // Par défaut, toute route nécessite l'auth
 
@@ -194,6 +211,9 @@ router.beforeEach((to, from) => {
     return { path: '/', query: { redirect: to.fullPath } }
   }
   // Si l'utilisateur est auth et essaie d'accéder au login
+  else if (!isBackOfficeRoute && to.meta.requiresExistingCustomer && isAnonymousCustomer) {
+    return { path: '/front/customers', query: { redirect: to.fullPath, checkout: '1' } }
+  }
   else if (to.path === '/back/login' && isBackOfficeAuthenticated) {
     console.log(`✓ User déjà auth, redirection vers import`);
     return '/back/import';

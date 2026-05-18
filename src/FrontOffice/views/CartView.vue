@@ -110,6 +110,11 @@ function updateQuantity(item: CartItem, event: Event) {
 }
 
 function goCheckout() {
+  if (localStorage.getItem('auth_is_anonymous') === 'true') {
+    router.push({ path: '/front/customers', query: { redirect: '/checkout', checkout: '1' } })
+    return
+  }
+
   const stockCheck = cart.validateCartStock()
   if (stockCheck.success) {
     router.push('/checkout')

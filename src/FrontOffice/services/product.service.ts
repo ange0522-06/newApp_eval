@@ -21,13 +21,12 @@ function getMainImageId(doc: Document | Element): string {
 }
 
 function normalizeProductDate(value: string): string {
-  if (!value || value.startsWith('0000-00-00')) return ''
+  if (!value || value.startsWith('00-00-0000')) return ''
   return value
 }
 
 function getProductReleaseDate(doc: Document | Element): string {
-  return normalizeProductDate(getText(doc, 'available_date')) ||
-    normalizeProductDate(getText(doc, 'date_add'))
+  return normalizeProductDate(getText(doc, 'available_date'))
 }
 
 function getReleaseBadge(dateValue: string): 'HOT' | 'NEW' | undefined {
