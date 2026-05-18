@@ -566,6 +566,12 @@ async function findStockAvailableId(productId: string, combinationId = '0'): Pro
   return null;
 }
 
+function resetStockCache(): void {
+  stockAvailableByProductKey.clear();
+  stockAvailableCacheLoaded = false;
+  console.log('🔄 Cache des stocks réinitialisé pour rechargement');
+}
+
 async function updateStock(
   transaction: ImportTransaction,
   step: string,
@@ -1409,6 +1415,10 @@ export async function importDeclinaisons(
   const endTime = performance.now();
   console.log(`✅ Fichier 2 traité en ${((endTime - startTime) / 1000).toFixed(2)}s`);
   
+  // ✅ CRITICAL: Réinitialiser le cache des stocks avant le fichier 3
+  // Sinon les stocks créés en fichier 2 ne seront pas visibles en fichier 3
+  resetStockCache();
+  
   transaction.markStepSuccess('fichier2');
 }
 
@@ -1607,6 +1617,10 @@ export async function importCommandes(
   transaction: ImportTransaction
 ): Promise<void> {
   transaction.registerStep('fichier3');
+  
+  // ✅ CRITICAL: Réinitialiser le cache spécialisé des stocks avant toute validation
+  // Cela force le rechargement depuis la DB via loadAllStockAvailables()
+  resetStockCache();
   
   // ✅ OPTIMISATION: Précharger tous les caches en PARALLÈLE au début
   console.log('📥 Préchargement des ressources fichier3 en parallèle...');
