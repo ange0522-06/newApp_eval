@@ -38,7 +38,12 @@ function cleanHeader(header: string): string {
 
 function hasExactHeaders(headers: string[], expected: string[]): boolean {
   const cleaned = headers.map(cleanHeader);
-  return expected.every((header) => cleaned.includes(header));
+  // ✅ Case-insensitive mais RESPECTE les accents
+  // "Specificité" === "specificité" OK (juste casse différente)
+  // "specificite" !== "specificité" NOT OK (accent manquant = caractère différent)
+  return expected.every((header) => 
+    cleaned.some(h => h.toLowerCase() === header.toLowerCase())
+  );
 }
 
 /**
@@ -191,10 +196,12 @@ export function parseAchat(
 }
 
 /**
- * Recupere l'index d'une colonne par son nom exact.
+ * ✅ Recupere l'index d'une colonne par son nom (case-insensitive mais respecte accents).
  */
 export function getColumnIndex(headers: string[], columnName: string): number {
-  const index = headers.findIndex((header) => cleanHeader(header) === columnName);
+  const index = headers.findIndex((header) => 
+    cleanHeader(header).toLowerCase() === columnName.toLowerCase()
+  );
   return index >= 0 ? index : -1;
 }
 

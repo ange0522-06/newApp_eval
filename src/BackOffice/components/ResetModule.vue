@@ -55,6 +55,65 @@
     >
       {{ message }}
     </div>
+
+    <!-- Détails des erreurs -->
+    <div v-if="details && (details.failed.length > 0 || details.deleted.length > 0 || details.updated.length > 0)" class="details-box">
+      <!-- Résumé -->
+      <div class="summary">
+        <p v-if="details.deletedCount > 0" class="deleted-count">
+          ✓ <strong>{{ details.deletedCount }}</strong> élément(s) supprimé(s)
+        </p>
+        <p v-if="details.updatedCount > 0" class="updated-count">
+          ✓ <strong>{{ details.updatedCount }}</strong> élément(s) mis à jour
+        </p>
+        <p v-if="details.failed.length > 0" class="failed-count">
+          ✗ <strong>{{ details.failed.length }}</strong> erreur(s)
+        </p>
+        <p v-if="details.skipped.length > 0" class="skipped-count">
+          ⊙ <strong>{{ details.skipped.length }}</strong> élément(s) ignoré(s)
+        </p>
+      </div>
+
+      <!-- Erreurs détaillées -->
+      <div v-if="details.failed.length > 0" class="errors-section">
+        <h3>Détails des erreurs ({{ details.failed.length }}):</h3>
+        <ul class="error-list">
+          <li v-for="(error, idx) in details.failed" :key="idx" class="error-item">
+            {{ error }}
+          </li>
+        </ul>
+      </div>
+
+      <!-- Éléments supprimés -->
+      <div v-if="details.deleted.length > 0" class="deleted-section">
+        <h3>Éléments supprimés:</h3>
+        <ul class="deleted-list">
+          <li v-for="(deleted, idx) in details.deleted" :key="idx" class="deleted-item">
+            {{ deleted }}
+          </li>
+        </ul>
+      </div>
+
+      <!-- Éléments mis à jour -->
+      <div v-if="details.updated.length > 0" class="updated-section">
+        <h3>Éléments mis à jour:</h3>
+        <ul class="updated-list">
+          <li v-for="(updated, idx) in details.updated" :key="idx" class="updated-item">
+            {{ updated }}
+          </li>
+        </ul>
+      </div>
+
+      <!-- Éléments ignorés -->
+      <div v-if="details.skipped.length > 0" class="skipped-section">
+        <h3>Éléments ignorés (protégés):</h3>
+        <ul class="skipped-list">
+          <li v-for="(skip, idx) in details.skipped" :key="idx" class="skipped-item">
+            {{ skip }}
+          </li>
+        </ul>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -62,7 +121,7 @@
 import { ref } from 'vue';
 import { useReset } from '../composables/useReset';
 
-const { isRunning, message, isSuccess, performReset } = useReset();
+const { isRunning, message, isSuccess, details, performReset } = useReset();
 const showConfirmModal = ref(false);
 
 function openConfirmModal(): void {

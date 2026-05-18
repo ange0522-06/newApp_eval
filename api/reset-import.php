@@ -53,7 +53,23 @@ function reset_delete_ids(string $resource, array $ids, array &$deleted, array &
             ps_delete_resource($resource, $id);
             $deleted[$resource] = ($deleted[$resource] ?? 0) + 1;
         } catch (Throwable $exception) {
-            $failed[] = $resource . '/' . $id . ': ' . $exception->getMessage();
+            // ✅ Format meilleur: resource/id
+            $error = trim($exception->getMessage());
+            $failed[] = $resource . '/' . $id . ': ' . ($error ?: 'Erreur inconnue');
+        }
+    }
+}
+
+function reset_update_stock_quantities(array $ids, array &$updated, array &$failed): void
+{
+    $ids = reset_normalize_ids($ids);
+    foreach ($ids as $id) {
+        try {
+            ps_update_resource_fields('stock_availables', $id, ['quantity' => 0]);
+            $updated['stock_availables'] = ($updated['stock_availables'] ?? 0) + 1;
+        } catch (Throwable $exception) {
+            $error = trim($exception->getMessage());
+            $failed[] = 'stock_availables/' . $id . ': ' . ($error ?: 'Erreur inconnue');
         }
     }
 }
@@ -71,7 +87,10 @@ function reset_protected_customer_data(array $protectedCustomerIds, array &$skip
         'order_carriers' => [],
         'order_cart_rules' => [],
         'order_invoices' => [],
-        'order_slips' => [],
+        'order_slip' => [],
+        'products' => [],
+        'combinations' => [],
+        'stock_availables' => [],
     ];
 
     $orderReferences = [];
@@ -101,7 +120,7 @@ function reset_protected_customer_data(array $protectedCustomerIds, array &$skip
     }
 
     foreach (reset_normalize_ids($protected['orders']) as $orderId) {
-        foreach (['order_histories', 'order_details', 'order_carriers', 'order_cart_rules', 'order_invoices', 'order_slips'] as $resource) {
+        foreach (['order_histories', 'order_details', 'order_carriers', 'order_cart_rules', 'order_invoices', 'order_slip'] as $resource) {
             $ids = ps_find_ids_by_field($resource, 'id_order', $orderId);
             if ($ids) {
                 $protected[$resource] = array_merge($protected[$resource], $ids);
@@ -113,6 +132,43 @@ function reset_protected_customer_data(array $protectedCustomerIds, array &$skip
         $ids = ps_find_ids_by_field('order_payments', 'order_reference', $reference);
         if ($ids) {
             $protected['order_payments'] = array_merge($protected['order_payments'], $ids);
+        }
+    }
+
+    // ✅ Protéger les produits des commandes protégées
+    foreach (reset_normalize_ids($protected['orders']) as $orderId) {
+        $productIds = ps_find_ids_by_field('order_details', 'id_order', $orderId);
+        if ($productIds) {
+            // order_details contient id_order + id_product, chercher les produits
+            foreach (ps_list_full_nodes('order_details', ['filter[id_order]' => ps_filter_value($orderId)]) as $detail) {
+                $productId = (int) ps_text($detail, 'product_id');
+                if ($productId > 0) {
+                    $protected['products'][] = $productId;
+                }
+            }
+        }
+    }
+
+    // ✅ Protéger les combinations des produits protégés
+    foreach (reset_normalize_ids($protected['products']) as $productId) {
+        $combinationIds = ps_find_ids_by_field('combinations', 'id_product', $productId);
+        if ($combinationIds) {
+            $protected['combinations'] = array_merge($protected['combinations'], $combinationIds);
+        }
+    }
+
+    // ✅ Protéger les stocks des produits protégés
+    foreach (reset_normalize_ids($protected['products']) as $productId) {
+        $stockIds = ps_find_ids_by_field('stock_availables', 'id_product', $productId);
+        if ($stockIds) {
+            $protected['stock_availables'] = array_merge($protected['stock_availables'], $stockIds);
+        }
+    }
+    // ✅ Protéger aussi les stocks des combinations protégées
+    foreach (reset_normalize_ids($protected['combinations']) as $combinationId) {
+        $stockIds = ps_find_ids_by_field('stock_availables', 'id_product_attribute', $combinationId);
+        if ($stockIds) {
+            $protected['stock_availables'] = array_merge($protected['stock_availables'], $stockIds);
         }
     }
 
@@ -153,6 +209,7 @@ function reset_category_ids(array $protectedCategoryIds, array &$skipped): array
 
 try {
     $deleted = [];
+    $updated = [];
     $skipped = [];
     $failed = [];
     $protectedCustomerData = reset_protected_customer_data($protectedCustomerIds, $skipped);
@@ -165,7 +222,7 @@ try {
         'order_carriers',
         'order_cart_rules',
         'order_invoices',
-        'order_slips',
+        'order_slip',
         'orders',
     ];
 
@@ -222,42 +279,132 @@ try {
         $skipped[] = 'images: ' . $e->getMessage();
     }
 
-    // Step 4: Delete stock_availables before combinations/products
+    // Step 4: Reset stock_availables before combinations/products.
+    // PrestaShop exposes this resource but does not allow DELETE on it.
     $stockIds = reset_list_ids_safe('stock_availables', $skipped);
-    reset_delete_ids('stock_availables', $stockIds, $deleted, $failed);
+    // ✅ Protéger les stocks des produits/combinations protégés
+    if (!empty($protectedCustomerData['stock_availables'])) {
+        $stockIds = array_values(array_diff($stockIds, $protectedCustomerData['stock_availables']));
+    }
+    reset_update_stock_quantities($stockIds, $updated, $failed);
 
     // Step 5: Delete combinations before products
-    $combinationIds = reset_list_ids_safe('combinations', $skipped);
-    reset_delete_ids('combinations', $combinationIds, $deleted, $failed);
+    // ✅ Supprimer les combinations SANS passer par combinationIds (utiliser chaque product)
+    try {
+        $combinationIds = reset_list_ids_safe('combinations', $skipped);
+        // ✅ Protéger les combinations des produits protégés
+        if (!empty($protectedCustomerData['combinations'])) {
+            $combinationIds = array_values(array_diff($combinationIds, $protectedCustomerData['combinations']));
+        }
+        
+        // ✅ Essayer de supprimer par produit d'abord, puis par ID direct
+        $productIds = reset_list_ids_safe('products', $skipped);
+        if (!empty($protectedCustomerData['products'])) {
+            $productIds = array_values(array_diff($productIds, $protectedCustomerData['products']));
+        }
+        
+        foreach ($productIds as $productId) {
+            try {
+                $combosForProduct = ps_find_ids_by_field('combinations', 'id_product', $productId);
+                foreach ($combosForProduct as $comboId) {
+                    try {
+                        ps_delete_resource('combinations', $comboId);
+                        $deleted['combinations'] = ($deleted['combinations'] ?? 0) + 1;
+                    } catch (Throwable $e) {
+                        $failed[] = 'combinations/' . $comboId . ' (product ' . $productId . '): ' . $e->getMessage();
+                    }
+                }
+            } catch (Throwable $e) {
+                // Silently skip if finding combinations fails
+            }
+        }
+        
+        // Supprimer les combinations restantes par ID
+        reset_delete_ids('combinations', array_values(array_diff($combinationIds, $productIds)), $deleted, $failed);
+    } catch (Throwable $e) {
+        $skipped[] = 'combinations: ' . $e->getMessage();
+    }
 
     // Step 6: Delete products
     $ids = reset_list_ids_safe('products', $skipped);
+    // ✅ Protéger les produits des commandes protégées
     if (!empty($protectedCustomerData['products'])) {
         $ids = array_values(array_diff($ids, $protectedCustomerData['products']));
     }
     reset_delete_ids('products', $ids, $deleted, $failed);
 
     // Step 7: Delete product options and values
-    $optionDeletions = [
-        'product_option_values',
-        'product_options',
-    ];
+    // ✅ Supprimer les option_values AVANT les options
+    try {
+        $optionValueIds = reset_list_ids_safe('product_option_values', $skipped);
+        foreach ($optionValueIds as $valueId) {
+            try {
+                ps_delete_resource('product_option_values', $valueId);
+                $deleted['product_option_values'] = ($deleted['product_option_values'] ?? 0) + 1;
+            } catch (Throwable $e) {
+                $failed[] = 'product_option_values/' . $valueId . ': ' . $e->getMessage();
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'product_option_values: ' . $e->getMessage();
+    }
 
-    foreach ($optionDeletions as $resource) {
-        $ids = reset_list_ids_safe($resource, $skipped);
-        reset_delete_ids($resource, $ids, $deleted, $failed);
+    try {
+        $optionIds = reset_list_ids_safe('product_options', $skipped);
+        foreach ($optionIds as $optionId) {
+            try {
+                ps_delete_resource('product_options', $optionId);
+                $deleted['product_options'] = ($deleted['product_options'] ?? 0) + 1;
+            } catch (Throwable $e) {
+                $failed[] = 'product_options/' . $optionId . ': ' . $e->getMessage();
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'product_options: ' . $e->getMessage();
     }
 
     // Step 8: Delete tax-related data
-    $taxDeletions = [
-        'tax_rules',
-        'tax_rule_groups',
-        'taxes',
-    ];
+    // ✅ Supprimer tax_rules AVANT tax_rule_groups (dépendance)
+    try {
+        $taxRuleIds = reset_list_ids_safe('tax_rules', $skipped);
+        foreach ($taxRuleIds as $ruleId) {
+            try {
+                ps_delete_resource('tax_rules', $ruleId);
+                $deleted['tax_rules'] = ($deleted['tax_rules'] ?? 0) + 1;
+            } catch (Throwable $e) {
+                $failed[] = 'tax_rules/' . $ruleId . ': ' . $e->getMessage();
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'tax_rules: ' . $e->getMessage();
+    }
 
-    foreach ($taxDeletions as $resource) {
-        $ids = reset_list_ids_safe($resource, $skipped);
-        reset_delete_ids($resource, $ids, $deleted, $failed);
+    try {
+        $taxRuleGroupIds = reset_list_ids_safe('tax_rule_groups', $skipped);
+        foreach ($taxRuleGroupIds as $groupId) {
+            try {
+                ps_delete_resource('tax_rule_groups', $groupId);
+                $deleted['tax_rule_groups'] = ($deleted['tax_rule_groups'] ?? 0) + 1;
+            } catch (Throwable $e) {
+                $failed[] = 'tax_rule_groups/' . $groupId . ': ' . $e->getMessage();
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'tax_rule_groups: ' . $e->getMessage();
+    }
+
+    try {
+        $taxIds = reset_list_ids_safe('taxes', $skipped);
+        foreach ($taxIds as $taxId) {
+            try {
+                ps_delete_resource('taxes', $taxId);
+                $deleted['taxes'] = ($deleted['taxes'] ?? 0) + 1;
+            } catch (Throwable $e) {
+                $failed[] = 'taxes/' . $taxId . ': ' . $e->getMessage();
+            }
+        }
+    } catch (Throwable $e) {
+        $skipped[] = 'taxes: ' . $e->getMessage();
     }
 
     // Step 9: Delete categories (except protected ones)
@@ -268,15 +415,16 @@ try {
     }
 
     $deletedCount = array_sum($deleted);
+    $updatedCount = array_sum($updated);
     $failedCount = count($failed);
     // Success = at least something was deleted (partial reset is acceptable)
-    $success = $deletedCount > 0 || $failedCount === 0;
+    $success = $deletedCount > 0 || $updatedCount > 0 || $failedCount === 0;
     $message = $failedCount > 0
-        ? 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s), ' . $failedCount . ' echec(s) (certaines donnees protegees peuvent rester).'
-        : 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s). Categories 1 et 2, customer 1 et ses donnees liees sont conservees.';
+        ? 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s), ' . $updatedCount . ' element(s) mis a jour, ' . $failedCount . ' echec(s) (certaines donnees protegees peuvent rester).'
+        : 'Reset API XML termine: ' . $deletedCount . ' element(s) supprime(s), ' . $updatedCount . ' element(s) mis a jour. Categories 1 et 2, customer 1 et ses donnees liees sont conservees.';
 
     $xml = '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
-    $xml .= '<prestashop success="' . ($success ? '1' : '0') . '" deletedCount="' . $deletedCount . '" skippedCount="' . count($skipped) . '" failedCount="' . $failedCount . '">' . "\n";
+    $xml .= '<prestashop success="' . ($success ? '1' : '0') . '" deletedCount="' . $deletedCount . '" updatedCount="' . $updatedCount . '" skippedCount="' . count($skipped) . '" failedCount="' . $failedCount . '">' . "\n";
     $xml .= '  <message>' . htmlspecialchars($message, ENT_XML1, 'UTF-8') . '</message>' . "\n";
     $xml .= '  <details>' . "\n";
     
@@ -286,6 +434,13 @@ try {
         $xml .= '      <item resource="' . htmlspecialchars($resource, ENT_XML1, 'UTF-8') . '">' . $count . '</item>' . "\n";
     }
     $xml .= '    </deleted>' . "\n";
+
+    // Updated items
+    $xml .= '    <updated>' . "\n";
+    foreach ($updated as $resource => $count) {
+        $xml .= '      <item resource="' . htmlspecialchars($resource, ENT_XML1, 'UTF-8') . '">' . $count . '</item>' . "\n";
+    }
+    $xml .= '    </updated>' . "\n";
     
     // Skipped items
     $xml .= '    <skipped>' . "\n";

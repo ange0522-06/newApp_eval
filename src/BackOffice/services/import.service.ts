@@ -137,10 +137,51 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function processInBatches<T>(items: T[], batchSize: number, handler: (item: T, index: number) => Promise<void>): Promise<void> {
+/**
+ * ✅ OPTIMISATION: Traite les items par lots avec parallélisme amélioré
+ * @param items Items à traiter
+ * @param batchSize Nombre d'items par lot (défaut: 20)
+ * @param handler Fonction de traitement
+ * @param maxConcurrency Nombre max de traitements parallèles par lot (défaut: 5)
+ */
+async function processInBatches<T>(
+  items: T[], 
+  batchSize: number, 
+  handler: (item: T, index: number) => Promise<void>,
+  maxConcurrency = 5
+): Promise<void> {
   for (let start = 0; start < items.length; start += batchSize) {
     const batch = items.slice(start, start + batchSize);
-    await Promise.all(batch.map((item, offset) => handler(item, start + offset)));
+    const concurrentPromises: Promise<void>[] = [];
+
+    for (let i = 0; i < batch.length; i++) {
+      const itemIndex = start + i;
+      const promise = handler(batch[i], itemIndex)
+        .catch(error => {
+          console.error(`Erreur item ${itemIndex}:`, error);
+          throw error;
+        });
+
+      concurrentPromises.push(promise);
+
+      // ✅ Si on atteint maxConcurrency, attendre qu'une se termine
+      if (concurrentPromises.length >= maxConcurrency) {
+        await Promise.race(concurrentPromises)
+          .then(() => {
+            const idx = concurrentPromises.findIndex(p => p === promise);
+            if (idx !== -1) concurrentPromises.splice(idx, 1);
+          })
+          .catch((error) => {
+            console.error('Erreur Promise.race:', error);
+            throw error;
+          });
+      }
+    }
+
+    // ✅ Attendre toutes les promesses restantes du lot
+    if (concurrentPromises.length > 0) {
+      await Promise.all(concurrentPromises);
+    }
   }
 }
 
@@ -375,11 +416,13 @@ function setFirstTag(doc: Document, tagName: string, value: string | number): vo
 }
 
 function removeNotWritableFields(doc: Document): void {
+  // ✅ CRITIQUE: Ne JAMAIS supprimer date_add et date_upd
+  // Ces dates doivent venir du fichier d'import et être préservées dans PrestaShop
   // Supprimer les champs non modifiables PrestaShop
-  // Basé sur les attributs notFilterable="true" mais aussi liste explicite
   const nonWritableFields = [
-    'id', 'date_add', 'date_upd', 'views', 'rating', 'indexed',
+    'id', 'views', 'rating', 'indexed',
     'position_in_category', 'similarity', 'cache', 'status'
+    // ✅ 'date_add' et 'date_upd' ENLEVÉS - on les préserve toujours
   ];
   
   doc.querySelectorAll('[notFilterable="true"]').forEach((element) => element.remove());
@@ -919,6 +962,10 @@ export async function importProduits(
   productsByReference.clear();
   combinationsByReferenceAndValue.clear();
   resetImportCaches();
+  
+  // ✅ OPTIMISATION: Précharger tous les caches en PARALLÈLE au début
+  console.log('📥 Préchargement des ressources en parallèle...');
+  const startPreload = performance.now();
   await Promise.all([
     loadFullResource('products'),
     loadFullResource('categories'),
@@ -926,6 +973,7 @@ export async function importProduits(
     loadFullResource('tax_rule_groups'),
     loadFullResource('countries'),
   ]);
+  console.log(`✓ Préchargement terminé en ${Math.round(performance.now() - startPreload)}ms`);
 
   for (let i = 0; i < rows.length; i++) {
     const rowNumber = i + 2;
@@ -1366,11 +1414,16 @@ export async function importCommandes(
   transaction: ImportTransaction
 ): Promise<void> {
   transaction.registerStep('fichier3');
+  
+  // ✅ OPTIMISATION: Précharger tous les caches en PARALLÈLE au début
+  console.log('📥 Préchargement des ressources fichier3 en parallèle...');
+  const startPreload = performance.now();
   await Promise.all([
     loadFullResource('customers'),
     loadFullResource('carriers'),
     loadFullResource('countries'),
   ]);
+  console.log(`✓ Préchargement fichier3 terminé en ${Math.round(performance.now() - startPreload)}ms`);
 
   const orderStateMap: Record<string, string> = {
     'en attente paiement a la livraison': '13',

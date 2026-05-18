@@ -62,7 +62,21 @@ async function countPendingCarts(orderCartIds: Set<string>): Promise<number> {
   }
 }
 
+// ✅ OPTIMISATION: Cache pour les stats du dashboard (2 minutes)
+const dashboardStatsCache = { stats: null as DashboardStats | null, timestamp: 0 };
+const DASHBOARD_STATS_CACHE_TTL = 2 * 60 * 1000;
+
 export async function getDashboardStats(): Promise<DashboardStats> {
+  // ✅ OPTIMISATION: Vérifier le cache avant de charger
+  const now = Date.now();
+  if (dashboardStatsCache.stats && (now - dashboardStatsCache.timestamp) < DASHBOARD_STATS_CACHE_TTL) {
+    console.log(`✓ Stats dashboard (cache): ${dashboardStatsCache.stats.totalOrders} commandes`);
+    return dashboardStatsCache.stats;
+  }
+
+  console.log('📥 Chargement des stats du dashboard...');
+  const loadStartTime = performance.now();
+
   const orders = await getAllOrders()
   const dayMap = new Map<string, DashboardDayRow>()
   const stateMap = new Map<string, DashboardStateRow>()
@@ -98,11 +112,18 @@ export async function getDashboardStats(): Promise<DashboardStats> {
     })
   }
 
-  return {
+  const result: DashboardStats = {
     days: Array.from(dayMap.values()).sort((a, b) => b.date.localeCompare(a.date)),
     states: Array.from(stateMap.values()).sort((a, b) => a.label.localeCompare(b.label)),
     totalOrders: orders.length,
     totalAmount: orders.reduce((sum, order) => sum + toAmount(order), 0),
     pendingCarts,
-  }
+  };
+
+  // ✅ OPTIMISATION: Mettre en cache les résultats
+  dashboardStatsCache.stats = result;
+  dashboardStatsCache.timestamp = now;
+  console.log(`✓ Stats dashboard chargées en ${Math.round(performance.now() - loadStartTime)}ms`);
+
+  return result;
 }
