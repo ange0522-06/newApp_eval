@@ -300,6 +300,14 @@ function getCachedResource(resource: string, id: string): Record<string, string>
   return resourceFullCache.get(resource)?.get(id) || null;
 }
 
+function invalidateCachedResource(resource: string, id: string): void {
+  resourceFullCache.get(resource)?.delete(id);
+}
+
+function invalidateAllCachedResource(resource: string): void {
+  resourceFullCache.delete(resource);
+}
+
 function stockKey(productId: string, combinationId = '0'): string {
   return `${productId}::${combinationId || '0'}`;
 }
@@ -527,52 +535,108 @@ function removeNotWritableFields(doc: Document): void {
 async function updateProductTypeToCombinations(productId: string, transaction: ImportTransaction): Promise<void> {
   if (productsMarkedAsCombinations.has(productId)) return;
 
-  console.log(`  🔄 Changement du produit ${productId} en mode "combinations"...`);
+  console.log(`🔄 [PRODUIT ${productId}] Changement du type en mode "combinations"...`);
   
-  // 1. Récupérer le XML complet du produit
-  const productXml = (await getOneXml('products', productId)) as string;
-  const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+  let retryCount = 0;
+  const maxRetries = 5; // ⬆️ Augmenté à 5
   
-  // 2. Nettoyer les champs non modifiables
-  removeNotWritableFields(doc);
-  const previousWritableXml = new XMLSerializer().serializeToString(doc);
-  
-  // 3. Changer product_type en "combinations"
-  setFirstTag(doc, 'product_type', 'combinations');
-  
-  // 4. Envoyer le PUT
-  const nextXml = new XMLSerializer().serializeToString(doc);
-  const ok = await putXML('products', productId, nextXml);
-  
-  if (!ok) {
-    throw new Error(`Impossible de changer le type du produit ${productId} en "combinations". Vérifier les logs PrestaShop.`);
+  while (retryCount < maxRetries) {
+    try {
+      console.log(`  📋 [PRODUIT ${productId}] Tentative ${retryCount + 1}/${maxRetries}...`);
+      
+      // 1. Récupérer le XML complet du produit
+      const productXml = (await getOneXml('products', productId)) as string;
+      const doc = new DOMParser().parseFromString(productXml, 'text/xml');
+      
+      // 2. Vérifier le type ACTUEL
+      const currentType = doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type AVANT: "${currentType}"`);
+      
+      if (currentType === 'combinations') {
+        console.log(`  ✅ [PRODUIT ${productId}] Déjà en mode "combinations"`);
+        productsMarkedAsCombinations.add(productId);
+        return;
+      }
+      
+      // 3. Nettoyer et préparer le XML pour PUT
+      removeNotWritableFields(doc);
+      const previousWritableXml = new XMLSerializer().serializeToString(doc);
+      
+      // 4. Changer product_type en "combinations"
+      setFirstTag(doc, 'product_type', 'combinations');
+      const nextXml = new XMLSerializer().serializeToString(doc);
+      
+      console.log(`  📤 [PRODUIT ${productId}] Envoi du PUT...`);
+      const ok = await putXML('products', productId, nextXml);
+      
+      if (!ok) {
+        console.warn(`  ⚠️  [PRODUIT ${productId}] PUT retourné false`);
+        retryCount += 1;
+        await wait(2000 * retryCount); // Délai exponentiel
+        continue;
+      }
+      
+      console.log(`  ⏳ [PRODUIT ${productId}] Attente 2000ms pour synchronisation BD...`);
+      await wait(2000);
+      
+      // 🔴 INVALIDER LE CACHE POUR FORCER UN RELOAD DEPUIS L'API
+      console.log(`  🔄 [PRODUIT ${productId}] Invalidation du cache (forcer reload depuis l'API)...`);
+      invalidateCachedResource('products', productId);
+      invalidateAllCachedResource('products');
+      
+      // 5. VÉRIFICATION #1 - Recharger et checker immédiatement
+      console.log(`  🔍 [PRODUIT ${productId}] Vérification #1...`);
+      const verify1Xml = (await getOneXml('products', productId)) as string;
+      const verify1Doc = new DOMParser().parseFromString(verify1Xml, 'text/xml');
+      const type1 = verify1Doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type après PUT: "${type1}"`);
+      
+      if (type1 !== 'combinations') {
+        console.warn(`  ⚠️  [PRODUIT ${productId}] Changement non appliqué. Nouvelle attente...`);
+        retryCount += 1;
+        await wait(3000 * retryCount); // Délai encore plus long
+        continue;
+      }
+      
+      // 6. VÉRIFICATION #2 - Attendre puis recharger à nouveau
+      console.log(`  ⏳ [PRODUIT ${productId}] Attente supplémentaire 3000ms...`);
+      await wait(3000);
+      
+      console.log(`  🔍 [PRODUIT ${productId}] Vérification #2 (finale)...`);
+      const verify2Xml = (await getOneXml('products', productId)) as string;
+      const verify2Doc = new DOMParser().parseFromString(verify2Xml, 'text/xml');
+      const type2 = verify2Doc.querySelector('product_type')?.textContent?.trim();
+      console.log(`  📊 [PRODUIT ${productId}] Type après vérification finale: "${type2}"`);
+      
+      if (type2 !== 'combinations') {
+        console.error(`  ❌ [PRODUIT ${productId}] ERREUR CRITIQUE: Le type a disparu après vérification!`);
+        console.error(`  XML du produit:`, verify2Xml);
+        retryCount += 1;
+        if (retryCount >= maxRetries) {
+          throw new Error(
+            `[PRODUIT ${productId}] ERREUR APRÈS ${maxRetries} TENTATIVES: Le type n'a pas changé en "combinations" (type="${type2}"). ` +
+            `PrestaShop rejette probablement ce changement. Vérifier eval/var/logs/dev.log`
+          );
+        }
+        await wait(4000);
+        continue;
+      }
+      
+      console.log(`  ✅ [PRODUIT ${productId}] SUCCÈS - Changement confirmé`);
+      
+      // Tracker le changement pour rollback
+      productsMarkedAsCombinations.add(productId);
+      transaction.trackUpdate('fichier2', 'products', productId, previousWritableXml);
+      return; // Succès
+    } catch (error) {
+      console.error(`  ❌ [PRODUIT ${productId}] Erreur à la tentative ${retryCount + 1}:`, error);
+      if (retryCount >= maxRetries - 1) {
+        throw error;
+      }
+      retryCount += 1;
+      await wait(5000);
+    }
   }
-  
-  // 5. ✅ CRITIQUE: Attendre PLUS LONGTEMPS pour que PrestaShop synchronise la DB
-  // Les erreurs 500 vides indiquent que PrestaShop n'a pas appliqué le changement
-  await wait(500);
-  
-  // 6. Recharger le produit et vérifier que product_type est bien "combinations"
-  const verifyXml = (await getOneXml('products', productId)) as string;
-  const verifyDoc = new DOMParser().parseFromString(verifyXml, 'text/xml');
-  const productType = verifyDoc.querySelector('product_type')?.textContent?.trim();
-  
-  if (productType !== 'combinations') {
-    throw new Error(
-      `ERREUR CRITIQUE: Le produit ${productId} n'est pas passé en mode "combinations". ` +
-      `Type actuel: "${productType}". PrestaShop a possiblement rejeté le changement. ` +
-      `Vérifier les logs: eval/var/logs/dev.log ou eval/var/logs/prod.log`
-    );
-  }
-  
-  console.log(`  ✓ Produit ${productId} maintenant en mode "combinations"`);
-  
-  // 7. ✅ Attendre UN PEU PLUS avant de retourner (sync DB complète)
-  await wait(500);
-  
-  // Tracker le changement pour rollback
-  productsMarkedAsCombinations.add(productId);
-  transaction.trackUpdate('fichier2', 'products', productId, previousWritableXml);
 }
 
 async function updateResourceField(
@@ -1329,20 +1393,62 @@ async function createCombinationWithRecovery(params: {
 
   // ✅ CRITIQUE: Vérifier que le produit est bien en mode "combinations" avant POST
   // Les erreurs 500 vides = le produit n'est pas en mode "combinations" en BD
+  console.log(`\n  🔍 [COMBINAISON ${params.reference}] Diagnostic avant POST...`);
+  
   const productXml = (await getOneXml('products', params.productId)) as string;
   const doc = new DOMParser().parseFromString(productXml, 'text/xml');
   const productType = doc.querySelector('product_type')?.textContent?.trim();
   
+  console.log(`  📊 État du produit ${params.productId}:`);
+  console.log(`    - reference: ${doc.querySelector('reference')?.textContent?.trim()}`);
+  console.log(`    - type: "${productType}"`);
+  console.log(`    - active: ${doc.querySelector('active')?.textContent?.trim()}`);
+  console.log(`    - id_tax_rules_group: ${doc.querySelector('id_tax_rules_group')?.textContent?.trim()}`);
+  
   if (productType !== 'combinations') {
-    throw new Error(
-      `Produit ${params.productId}: type invalide pour combination "${productType}". ` +
-      `Doit être "combinations". ` +
-      `Vérifier que updateProductTypeToCombinations() a bien exécuté avant cette étape.`
-    );
+    console.error(`  ❌ ERREUR BLOCANTE: Produit ${params.productId} n'est PAS en mode "combinations"`);
+    console.error(`    Type actuel: "${productType}"`);
+    console.error(`    Cela va CAUSER une erreur HTTP 500`);
+    console.error(`    XML complet du produit:`);
+    console.error(productXml);
+    
+    console.error(`  🔴 TENTATIVE DE SAUVETAGE: Changement de type une fois de plus...`);
+    try {
+      const doc2 = new DOMParser().parseFromString(productXml, 'text/xml');
+      removeNotWritableFields(doc2);
+      setFirstTag(doc2, 'product_type', 'combinations');
+      const xml2 = new XMLSerializer().serializeToString(doc2);
+      const ok = await putXML('products', params.productId, xml2);
+      
+      if (!ok) {
+        throw new Error('PUT retourné false');
+      }
+      
+      console.error(`    ⏳ Attente 3000ms pour synchronisation...`);
+      await wait(3000);
+      
+      const verify2Xml = (await getOneXml('products', params.productId)) as string;
+      const verify2Doc = new DOMParser().parseFromString(verify2Xml, 'text/xml');
+      const type2 = verify2Doc.querySelector('product_type')?.textContent?.trim();
+      
+      if (type2 !== 'combinations') {
+        throw new Error(`Type toujours "${type2}" après nouvelle tentative`);
+      }
+      console.error(`    ✅ Type corrigé! Relance création combinaison...`);
+    } catch (retryError) {
+      throw new Error(
+        `[PRODUIT ${params.productId}] IMPOSSIBLE DE CRÉER COMBINAISON: ` +
+        `Le produit n'est pas en mode "combinations" (type="${productType}"). ` +
+        `Tentative de sauvetage échouée: ${retryError instanceof Error ? retryError.message : String(retryError)}. ` +
+        `Vérifier eval/var/logs/dev.log`
+      );
+    }
   }
   
-  // ✅ Attendre un peu pour que les verrous BD se libèrent
-  await wait(200);
+  console.log(`  ✅ Produit ${params.productId} confirmé en mode "combinations". Création de combinaison...`);
+  
+  // ✅ Attendre avant de créer la combinaison
+  await wait(500);
 
   const firstXml = buildCombinationXml(params);
   const firstResult = (await postXML('combinations', firstXml)) as unknown as CreatedResponse;
@@ -1544,15 +1650,24 @@ export async function importDeclinaisons(
     }
   }
 
-  // ✅ ÉTAPE 2: Mettre à jour le type pour TOUS les produits en parallèle (ne se fait qu'une fois grâce au cache)
+  // ✅ ÉTAPE 2: Mettre à jour le type pour TOUS les produits SÉQUENTIELLEMENT pour éviter les race conditions
   if (productsToUpdateType.size > 0) {
-    console.log(`⚡ Changement du type pour ${productsToUpdateType.size} produits en parallèle...`);
-    await Promise.all(
-      Array.from(productsToUpdateType).map(productId =>
-        updateProductTypeToCombinations(productId, transaction)
-      )
-    );
-    console.log(`✅ Type changé avec succès`);
+    const productArray = Array.from(productsToUpdateType);
+    console.log(`\n⚡ ÉTAPE 2: Changement du type pour ${productArray.length} produits...`);
+    for (let i = 0; i < productArray.length; i += 1) {
+      const productId = productArray[i];
+      console.log(`\n[${i + 1}/${productArray.length}] Traitement du produit ${productId}...`);
+      try {
+        await updateProductTypeToCombinations(productId, transaction);
+        console.log(`[${i + 1}/${productArray.length}] ✅ Produit ${productId} OK`);
+      } catch (error) {
+        console.error(`[${i + 1}/${productArray.length}] ❌ Produit ${productId} ÉCHOUÉ:`, error);
+        throw error;
+      }
+      // Petit délai entre chaque produit pour éviter les contentions BD
+      await wait(500);
+    }
+    console.log(`\n✅ ÉTAPE 2 COMPLÉTÉE: Tous les types changés avec succès`);
   }
 
   // ✅ ÉTAPE 3: Traiter les déclinaisons en ordre stable pour ne créer
