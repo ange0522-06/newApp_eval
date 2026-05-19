@@ -22,51 +22,6 @@
           <small>Entrez l'email du client existant</small>
         </div>
 
-        <!-- Infos chargées - LECTURE SEULE -->
-        <div v-if="customerLoaded" class="customer-info">
-          <h3>Informations du client</h3>
-          
-          <div class="info-row">
-            <div class="info-group">
-              <label>Prénom</label>
-              <p>{{ firstname || '(non renseigné)' }}</p>
-            </div>
-            <div class="info-group">
-              <label>Nom</label>
-              <p>{{ lastname || '(non renseigné)' }}</p>
-            </div>
-          </div>
-
-          <div class="info-row">
-            <div class="info-group full">
-              <label>Adresse</label>
-              <p>{{ address1 || '(non renseignée)' }}</p>
-            </div>
-          </div>
-
-          <div class="info-row">
-            <div class="info-group">
-              <label>Ville</label>
-              <p>{{ city || '(non renseignée)' }}</p>
-            </div>
-            <div class="info-group">
-              <label>Code postal</label>
-              <p>{{ postcode || '(non renseigné)' }}</p>
-            </div>
-          </div>
-
-          <div class="info-row">
-            <div class="info-group">
-              <label>Téléphone</label>
-              <p>{{ phone || '(non renseigné)' }}</p>
-            </div>
-          </div>
-
-          <p class="info-note">
-            ✏️ Pour modifier ces infos, allez à <router-link to="/profile">mon profil</router-link>
-          </p>
-        </div>
-
         <!-- Résumé panier -->
         <div class="summary">
           <h3>Résumé de la commande</h3>
@@ -91,7 +46,7 @@
 
         <button 
           class="btn-order" 
-          :disabled="isPlacing || !cart.items.length || !email || !customerLoaded"
+          :disabled="isPlacing || !cart.items.length || !email"
           @click="handleSubmit"
         >
           {{ isPlacing ? '⏳ Création de la commande...' : '✅ Commander' }}
@@ -112,26 +67,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useCartStore } from '../stores/cart.store'
-import { getOne, getAllIds } from '@/shared/services/prestashop.service.js'
 
 const cart = useCartStore()
 const router = useRouter()
 
 const email = ref('')
-const firstname = ref('')
-const lastname = ref('')
-const address1 = ref('')
-const city = ref('')
-const postcode = ref('')
-const phone = ref('')
 const isPlacing = ref(false)
 const result = ref<any>(null)
 const formError = ref('')
 const isLoading = ref(true)
-const customerLoaded = ref(false)
 
 const isAuthenticated = computed(() =>
   localStorage.getItem('auth_authenticated') === 'true' &&
@@ -144,73 +91,6 @@ function formatPrice(value: number) {
   return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' }).format(value)
 }
 
-/**
- * Charge les infos du client à partir de son email
- * Appelée quand l'utilisateur saisit l'email
- */
-async function loadCustomerByEmail(emailToSearch: string) {
-  if (!emailToSearch || emailToSearch.trim() === '') {
-    customerLoaded.value = false
-    firstname.value = ''
-    lastname.value = ''
-    address1.value = ''
-    city.value = ''
-    postcode.value = ''
-    phone.value = ''
-    return
-  }
-
-  try {
-    customerLoaded.value = false
-
-    // Trouver le client par email
-    const customerIds = await getAllIds('customers')
-    for (const id of customerIds) {
-      const customer: any = await getOne('customers', id)
-      if (customer && customer.email === emailToSearch) {
-        firstname.value = customer.firstname || ''
-        lastname.value = customer.lastname || ''
-        phone.value = customer.phone || ''
-
-        // Récupérer l'adresse par défaut si elle existe
-        if (customer.id_default_address && customer.id_default_address !== '0') {
-          try {
-            const address: any = await getOne('addresses', customer.id_default_address)
-            address1.value = address.address1 || ''
-            city.value = address.city || ''
-            postcode.value = address.postcode || ''
-            phone.value = address.phone || phone.value
-          } catch {
-            // Pas d'adresse par défaut
-          }
-        }
-
-        customerLoaded.value = true
-        return
-      }
-    }
-
-    // Client non trouvé
-    formError.value = `❌ Aucun client trouvé avec l'email: ${emailToSearch}`
-    customerLoaded.value = false
-  } catch (err) {
-    console.error('Erreur chargement client:', err)
-    formError.value = 'Erreur lors de la recherche du client'
-    customerLoaded.value = false
-  }
-}
-
-// Observer l'email - charger les infos du client automatiquement
-watch(
-  () => email.value,
-  (newEmail) => {
-    formError.value = ''
-    if (newEmail.includes('@')) {
-      loadCustomerByEmail(newEmail)
-    }
-  }
-)
-
 async function handleSubmit() {
   formError.value = ''
 
@@ -219,27 +99,10 @@ async function handleSubmit() {
     return
   }
 
-  if (!customerLoaded.value) {
-    formError.value = `❌ Client non trouvé avec l'email: ${email.value}`
-    return
-  }
-
-  if (!firstname.value || !lastname.value || !address1.value || !city.value || !postcode.value) {
-    formError.value = '❌ Les infos du client sont incomplètes. Complétez le profil du client d\'abord.'
-    return
-  }
-
   isPlacing.value = true
   result.value = null
 
-  const res = await cart.placeOrder({
-    firstname: firstname.value,
-    lastname: lastname.value,
-    address1: address1.value,
-    city: city.value,
-    postcode: postcode.value,
-    phone: phone.value,
-  })
+  const res = await cart.placeOrder({ email: email.value })
 
   result.value = res
   isPlacing.value = false
@@ -337,67 +200,6 @@ form {
   outline: none;
   border-color: #2a7ae2;
   box-shadow: 0 0 4px rgba(42, 122, 226, 0.3);
-}
-
-/* CUSTOMER INFO - LECTURE SEULE */
-.customer-info {
-  background: #f9f9f9;
-  border-left: 4px solid #28a745;
-  padding: 1.5rem;
-  border-radius: 4px;
-}
-
-.customer-info h3 {
-  margin-top: 0;
-  margin-bottom: 1rem;
-  color: #333;
-}
-
-.info-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 1rem;
-  margin-bottom: 1rem;
-}
-
-.info-row .full {
-  grid-column: 1 / -1;
-}
-
-.info-group label {
-  display: block;
-  font-size: 0.85rem;
-  color: #666;
-  text-transform: uppercase;
-  font-weight: bold;
-  margin-bottom: 0.25rem;
-}
-
-.info-group p {
-  margin: 0;
-  padding: 0.5rem;
-  background: white;
-  border-radius: 4px;
-  color: #333;
-  min-height: 2rem;
-  display: flex;
-  align-items: center;
-}
-
-.info-note {
-  margin-top: 1rem;
-  padding: 0.75rem;
-  background: #e3f2fd;
-  color: #1565c0;
-  border-radius: 4px;
-  font-size: 0.9rem;
-  margin-bottom: 0;
-}
-
-.info-note a {
-  color: #2a7ae2;
-  text-decoration: underline;
-  cursor: pointer;
 }
 
 /* SUMMARY */

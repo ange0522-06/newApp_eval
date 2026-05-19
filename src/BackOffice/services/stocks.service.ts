@@ -37,7 +37,17 @@ type StockHistoryEntry = {
   source: string;
 }
 
-const RESERVED_ORDER_STATES = new Set(['2', '13']);
+/**
+ * Réservé = commandes avec paiement effectué (état 11)
+ * Les paniers actifs sans commande sont gérés séparément via getCartReservedQty
+ */
+const RESERVED_ORDER_STATES = new Set(['11']);
+
+/**
+ * Mouvement physique = livraison (état 5) → la quantité physique diminue
+ */
+const DELIVERED_STATE = '5';
+
 const HISTORY_KEY = 'bo_stock_manual_history';
 
 function parseQty(value: unknown): number {
@@ -101,7 +111,10 @@ async function getBaseMaps() {
   return { productMap, categoryMap };
 }
 
-async function getReservedQuantityByStockKey(): Promise<Map<string, number>> {
+/**
+ * Quantités réservées via les commandes à l'état "paiement effectué" (id_state = 11).
+ */
+async function getOrderReservedQty(): Promise<Map<string, number>> {
   const [ordersRaw, detailsRaw] = await Promise.all([
     getFullResource('orders', '[id,current_state]').catch(() => []),
     getFullResource('order_details', '[id_order,product_id,product_attribute_id,product_quantity]').catch(() => []),
@@ -112,8 +125,8 @@ async function getReservedQuantityByStockKey(): Promise<Map<string, number>> {
       .filter((order) => RESERVED_ORDER_STATES.has(order.current_state || ''))
       .map((order) => order.id)
   );
-  const reservedByKey = new Map<string, number>();
 
+  const reservedByKey = new Map<string, number>();
   for (const detail of detailsRaw as any[]) {
     if (!reservedOrderIds.has(detail.id_order)) continue;
     const key = `${detail.product_id || ''}_${detail.product_attribute_id || '0'}`;
@@ -121,6 +134,60 @@ async function getReservedQuantityByStockKey(): Promise<Map<string, number>> {
   }
 
   return reservedByKey;
+}
+
+/**
+ * Quantités réservées via les paniers actifs (paniers sans commande associée = "dans le panier" ou "vide").
+ * Ces paniers n'ont pas encore généré de commande.
+ */
+async function getCartReservedQty(): Promise<Map<string, number>> {
+  try {
+    const [cartsRaw, cartProductsRaw, ordersRaw] = await Promise.all([
+      getFullResource('carts', '[id,id_customer]').catch(() => []),
+      getFullResource('customizations', '[id_cart,id_product,id_product_attribute,quantity]').catch(() => []),
+      getFullResource('orders', '[id,id_cart]').catch(() => []),
+    ]);
+
+    // IDs des paniers déjà convertis en commande
+    const cartIdsWithOrder = new Set(
+      (ordersRaw as any[]).map((order) => order.id_cart).filter(Boolean)
+    );
+
+    // Paniers actifs = paniers avec un client, non encore commandés
+    const activeCartIds = new Set(
+      (cartsRaw as any[])
+        .filter((cart) => cart.id_customer && !cartIdsWithOrder.has(cart.id))
+        .map((cart) => cart.id)
+    );
+
+    const reservedByKey = new Map<string, number>();
+    for (const row of cartProductsRaw as any[]) {
+      if (!activeCartIds.has(row.id_cart)) continue;
+      const key = `${row.id_product || ''}_${row.id_product_attribute || '0'}`;
+      reservedByKey.set(key, (reservedByKey.get(key) || 0) + parseQty(row.quantity));
+    }
+
+    return reservedByKey;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Fusionne les réservations commandes (état 11) + paniers actifs.
+ */
+async function getReservedQuantityByStockKey(): Promise<Map<string, number>> {
+  const [orderReserved, cartReserved] = await Promise.all([
+    getOrderReservedQty(),
+    getCartReservedQty(),
+  ]);
+
+  const merged = new Map<string, number>(orderReserved);
+  for (const [key, qty] of cartReserved) {
+    merged.set(key, (merged.get(key) || 0) + qty);
+  }
+
+  return merged;
 }
 
 export async function getProductStockOptions(): Promise<ProductStockOption[]> {
@@ -181,6 +248,10 @@ export async function addProductStockQuantity(option: ProductStockOption, addedQ
   return updateProductStockQuantity(option, option.quantity + Math.max(0, Math.floor(addedQty || 0)));
 }
 
+/**
+ * Evolution du stock physique d'un produit.
+ * Un mouvement de sortie (livraison) est enregistré quand une commande passe à l'état livré (5).
+ */
 export async function getStockEvolution(option: ProductStockOption): Promise<StockEvolutionRow[]> {
   const rowsByDate = new Map<string, { incomingQty: number; outgoingQty: number; sources: Set<string> }>();
 
@@ -193,19 +264,22 @@ export async function getStockEvolution(option: ProductStockOption): Promise<Sto
     rowsByDate.set(key, row);
   }
 
+  // Historique des ajustements manuels via le BO
   for (const entry of readHistory()) {
     if (entry.productId === option.productId && (entry.combinationId || '0') === option.combinationId) {
       addMovement(entry.date, entry.delta, entry.source);
     }
   }
 
+  // Sorties physiques = commandes livrées (état 5)
   const [ordersRaw, detailsRaw] = await Promise.all([
     getFullResource('orders', '[id,date_add,current_state]').catch(() => []),
     getFullResource('order_details', '[id_order,product_id,product_attribute_id,product_quantity]').catch(() => []),
   ]);
+
   const deliveredOrders = new Map(
     (ordersRaw as any[])
-      .filter((order) => order.current_state === '5')
+      .filter((order) => order.current_state === DELIVERED_STATE)
       .map((order) => [order.id, order.date_add || ''])
   );
 
@@ -233,6 +307,12 @@ export async function getStockEvolution(option: ProductStockOption): Promise<Sto
   }).reverse();
 }
 
+/**
+ * Analyse des stocks par catégorie.
+ * - Qté physique  : quantité actuelle dans PrestaShop (diminue à la livraison)
+ * - Qté réservée  : commandes payées (état 11) + paniers actifs non encore commandés
+ * - Qté disponible: physique - réservée
+ */
 export async function getStockAnalysis(): Promise<StockCategoryRow[]> {
   try {
     const [stockOptions, reservedByKey] = await Promise.all([
@@ -254,8 +334,12 @@ export async function getStockAnalysis(): Promise<StockCategoryRow[]> {
 
       row.physicalQty += stock.quantity;
       row.reservedQty += reservedQty;
-      row.availableQty += Math.max(0, stock.quantity - reservedQty);
       stockMap.set(stock.categoryId, row);
+    }
+
+    // Calculer availableQty après agrégation complète par catégorie
+    for (const row of stockMap.values()) {
+      row.availableQty = Math.max(0, row.physicalQty - row.reservedQty);
     }
 
     return Array.from(stockMap.values()).sort((a, b) => a.categoryName.localeCompare(b.categoryName));
