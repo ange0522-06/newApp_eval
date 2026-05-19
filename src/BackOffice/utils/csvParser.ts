@@ -159,14 +159,14 @@ export function parseNumber(value: string): number {
 }
 
 /**
- * Convertit une date d/m/yyyy ou dd/mm/yyyy en yyyy-mm-dd HH:mm:ss.
+ * Convertit une date dd/mm/yyyy en yyyy-mm-dd HH:mm:ss.
  */
 export function parseDate(value: string): string {
   if (!value) {
     throw new Error('Date vide: format attendu dd/mm/yyyy');
   }
 
-  const match = value.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  const match = value.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (!match) {
     throw new Error(`Date invalide "${value}": format attendu dd/mm/yyyy`);
   }
@@ -238,7 +238,7 @@ function assertPositive(value: string, label: string, rowNumber: number, allowEm
   if (!value && allowEmpty) return;
   const parsed = parseNumber(value);
   if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`${label} ligne ${rowNumber}: montant positif attendu`);
+    throw new Error(`${label} ligne ${rowNumber}: montant positif attendu (montant negatif ou nul refuse)`);
   }
 }
 

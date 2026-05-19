@@ -18,6 +18,8 @@ import CheckoutView from '../FrontOffice/views/CheckoutView.vue';
 import CustomerLogin from '../FrontOffice/views/CustomerLogin.vue';
 import CustomerRegister from '../FrontOffice/views/CustomerRegister.vue';
 import CustomerSelectView from '../FrontOffice/views/CustomerSelectView.vue';
+import CustomerOrdersView from '../FrontOffice/views/CustomerOrdersView.vue';
+import CustomerProfileView from '../FrontOffice/views/CustomerProfileView.vue';
 
 // Shared Views
 import LandingView from '../shared/views/LandingView.vue';
@@ -77,14 +79,28 @@ const routes: RouteRecordRaw[] = [
     path: '/checkout',
     name: 'Checkout',
     component: CheckoutView,
-    meta: { requiresAuth: true, requiresExistingCustomer: true },
+    meta: { requiresAuth: true },
+  },
+
+  {
+    path: '/orders',
+    name: 'Orders',
+    component: CustomerOrdersView,
+    meta: { requiresAuth: true },
+  },
+
+  {
+    path: '/profile',
+    name: 'Profile',
+    component: CustomerProfileView,
+    meta: { requiresAuth: true },
   },
 
   {
     path: '/my-orders',
     name: 'MyOrders',
-    component: () => import('../FrontOffice/views/MyOrdersView.vue'),
-    meta: { requiresAuth: true, requiresExistingCustomer: true },
+    component: CustomerOrdersView,
+    meta: { requiresAuth: true },
   },
 
   // Front-office customer auth

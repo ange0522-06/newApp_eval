@@ -83,23 +83,32 @@ function handleCustomerLogout() {
 
       <!-- FrontOffice header with mini-cart (visible when not in backoffice) -->
       <header class="fo-header" v-if="!isBackOfficePage">
-        <div class="brand"><a href="/">Boutique</a></div>
+        <div class="brand"><a href="/">🛍️ Boutique</a></div>
         <div class="fo-links">
           <button v-if="!isCustomerAuthenticated" class="fo-link" type="button" @click="$router.push('/login')">
-            Connexion
+            🔐 Connexion
           </button>
           <button v-if="!isCustomerAuthenticated" class="fo-link" type="button" @click="$router.push('/register')">
-            Inscription
+            ✍️ Inscription
           </button>
-          <span v-if="isCustomerAuthenticated" class="customer-pill">{{ customerName }}</span>
-          <button v-if="isCustomerAuthenticated" class="fo-link" type="button" @click="$router.push('/my-orders')">
-            Mes commandes
-          </button>
-          <button v-if="isCustomerAuthenticated" class="fo-link" type="button" @click="handleCustomerLogout">
-            Deconnexion
-          </button>
+          
+          <!-- Menu client connecté -->
+          <div v-if="isCustomerAuthenticated" class="customer-menu">
+            <span class="customer-pill">👤 {{ customerName }}</span>
+            <button class="fo-link" type="button" @click="$router.push('/profile')">
+              ⚙️ Mon Profil
+            </button>
+            <button class="fo-link" type="button" @click="$router.push('/orders')">
+              📋 Mes Commandes
+            </button>
+            <button class="fo-link logout-link" type="button" @click="handleCustomerLogout">
+              🚪 Déconnexion
+            </button>
+          </div>
+
+          <!-- Panier -->
           <button class="cart-mini" type="button" @click="$router.push('/cart')">
-            <span>Panier</span>
+            <span>🛒</span>
             <span class="count">{{ cartCount }}</span>
           </button>
         </div>
@@ -115,11 +124,106 @@ function handleCustomerLogout() {
  
 
 <style scoped>
-.fo-header { display:flex; justify-content:space-between; align-items:center; padding:0.5rem 1rem; background:#f7f7f7 }
-.fo-links { display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap }
-.fo-link { cursor:pointer; border:0; background:transparent; color:#1f2937 }
-.customer-pill { color:#374151; font-size:0.9rem; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-.cart-mini { cursor:pointer; display:flex; gap:0.5rem; align-items:center; border:0; background:transparent; color:#1f2937 }
-.cart-mini .count{ background:#2a7ae2; color:#fff; padding:0.1rem 0.5rem; border-radius:10px }
-.btn-checkout{ margin-left:0.5rem; background:#2a7ae2; color:#fff; border:none; padding:0.25rem 0.5rem }
+.fo-header { 
+  display: flex; 
+  justify-content: space-between; 
+  align-items: center; 
+  padding: 0.75rem 1.5rem; 
+  background: linear-gradient(135deg, #f7f7f7 0%, #fafafa 100%);
+  border-bottom: 2px solid #e5e5e5;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+}
+
+.brand {
+  font-size: 1.3rem;
+  font-weight: bold;
+}
+
+.brand a {
+  color: #333;
+  text-decoration: none;
+}
+
+.brand a:hover {
+  color: #2a7ae2;
+}
+
+.fo-links { 
+  display: flex; 
+  gap: 1rem; 
+  align-items: center; 
+  flex-wrap: wrap;
+}
+
+.fo-link { 
+  cursor: pointer; 
+  border: 0; 
+  background: transparent; 
+  color: #374151;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  transition: all 0.3s;
+  font-weight: 500;
+}
+
+.fo-link:hover {
+  background: #e5e7eb;
+  color: #2a7ae2;
+}
+
+.logout-link {
+  color: #dc3545;
+}
+
+.logout-link:hover {
+  background: #f8d7da;
+  color: #c82333;
+}
+
+.customer-menu {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.customer-pill { 
+  color: #374151; 
+  font-size: 0.95rem;
+  font-weight: bold;
+  padding: 0.5rem 0.75rem;
+  background: #e5e7eb;
+  border-radius: 20px;
+  max-width: 220px; 
+  overflow: hidden; 
+  text-overflow: ellipsis; 
+  white-space: nowrap;
+}
+
+.cart-mini { 
+  cursor: pointer; 
+  display: flex; 
+  gap: 0.5rem; 
+  align-items: center; 
+  border: 2px solid #2a7ae2;
+  background: white;
+  color: #2a7ae2;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  font-weight: bold;
+  transition: all 0.3s;
+}
+
+.cart-mini:hover {
+  background: #2a7ae2;
+  color: white;
+}
+
+.cart-mini .count { 
+  background: #ff6b6b; 
+  color: #fff; 
+  padding: 0.2rem 0.5rem; 
+  border-radius: 10px;
+  font-size: 0.85rem;
+}
 </style>
